@@ -653,17 +653,20 @@ def read_proxies(path: Path) -> List[str]:
 def write_proxies(path: Path, proxies: List[str]) -> None:
     """Update the RAM cache for *path* and mark it dirty.
 
+    Deduplicates by bare IP:PORT (stripping all decorations) so the same
+    proxy can never appear twice even if its decorated form differs between
+    checks (e.g. different response times).  When duplicates exist the
+    *last* occurrence wins, which keeps the most recent check result.
+
     No disk I/O happens here.  The background flusher (or an explicit
     flush_write_buffer() call) persists the data to disk.
     """
-    seen: set = set()
-    unique: List[str] = []
+    # Use an ordered dict keyed by bare IP:PORT so the last write wins.
+    deduped: Dict[str, str] = {}
     for p in proxies:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
+        deduped[strip_decorations(p)] = p
     key = _cache_key(path)
-    _mem_cache[key] = unique
+    _mem_cache[key] = list(deduped.values())
     _mem_dirty.add(key)
 
 
@@ -744,13 +747,20 @@ def start_buffer_flusher() -> "asyncio.Task[None]":
 # No per-file locking is required.
 
 async def append_proxy(path: Path, entry: str) -> None:
-    """Append *entry* to the RAM cache for *path* (if not already present).
+    """Append *entry* to the RAM cache for *path*, deduplicating by bare IP:PORT.
+
+    If the same IP:PORT is already in the list (regardless of decorations
+    such as response time or country tag), the old entry is replaced with
+    the new one so the list always reflects the most recent check result.
     Marks the file dirty — no disk I/O.
     """
+    bare = strip_decorations(entry)
     existing = read_proxies(path)
-    if entry not in existing:
-        existing.append(entry)
-        write_proxies(path, existing)
+    updated = [e for e in existing if strip_decorations(e) != bare]
+    if len(updated) == len(existing) and entry in existing:
+        return  # exact duplicate, nothing to do
+    updated.append(entry)
+    write_proxies(path, updated)
 
 
 async def remove_proxy(path: Path, entry: str) -> None:
