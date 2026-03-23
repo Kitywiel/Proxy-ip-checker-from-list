@@ -29,6 +29,7 @@ Usage examples:
 import re
 import sys
 import time
+import json
 import random
 import asyncio
 import argparse
@@ -101,15 +102,19 @@ CHECKER_URLS: List[str] = [
 ]
 
 # Built-in proxy-list source URLs, organized by proxy type.
+# Sources include: GitHub auto-updated repos, proxyscrape v2/v3,
+# proxy-list.download, geonode, proxyscan.io, openproxy.space, spys.me.
 # Used by the `fetch` command.
 PROXY_SOURCE_URLS: Dict[str, List[str]] = {
     "http": [
+        # ── GitHub repos ────────────────────────────────────────────────────
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
         "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
         "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
         "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
         "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
         "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
         "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
@@ -134,19 +139,36 @@ PROXY_SOURCE_URLS: Dict[str, List[str]] = {
         "https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/http.txt",
         "https://raw.githubusercontent.com/im-razvan/proxy_list/main/http.txt",
         "https://raw.githubusercontent.com/mertguvencli/http-proxy-list/main/proxy-list/data.txt",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
-        "https://www.proxy-list.download/api/v1/get?type=http",
         "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/http.txt",
         "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
         "https://raw.githubusercontent.com/hendrikbgr/Free-Proxy-Repo/master/proxy_list.txt",
-        "https://raw.githubusercontent.com/manuGMG/proxy-365/main/SOCKS5.txt",
         "https://raw.githubusercontent.com/zinon/proxy-lists/master/lists/all-proxies.txt",
         "https://raw.githubusercontent.com/Nocturnusx/Proxy-list/main/http.txt",
         "https://raw.githubusercontent.com/yuceltoluyag/GoodProxy/main/raw.txt",
+        "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/http.txt",
+        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Http.txt",
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+        "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt",
+        "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
+        "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/andigwandi/free-proxy/main/proxy_list.txt",
+        "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+        "https://raw.githubusercontent.com/TundzhayDzhansaz/proxy-list-auto/main/proxies/http.txt",
+        # ── Web APIs ────────────────────────────────────────────────────────
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&proxy_format=ipport&format=text",
+        "https://www.proxy-list.download/api/v1/get?type=http",
+        "https://www.proxyscan.io/download?type=http",
+        "https://openproxy.space/list/http",
+        "https://spys.me/proxy.txt",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=http",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc&protocols=http",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=4&sort_by=lastChecked&sort_type=desc&protocols=http",
     ],
     "https": [
+        # ── GitHub repos ────────────────────────────────────────────────────
         "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
         "https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt",
         "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/https.txt",
@@ -157,12 +179,25 @@ PROXY_SOURCE_URLS: Dict[str, List[str]] = {
         "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/https.txt",
         "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
         "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+        "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/https.txt",
+        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt",
+        "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/https.txt",
+        "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/https_proxies.txt",
+        "https://raw.githubusercontent.com/aslisk/proxyhttps/main/https.txt",
+        # ── Web APIs ────────────────────────────────────────────────────────
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=https&timeout=10000&country=all",
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=https&timeout=10000&proxy_format=ipport&format=text",
         "https://www.proxy-list.download/api/v1/get?type=https",
+        "https://www.proxyscan.io/download?type=https",
+        "https://openproxy.space/list/https",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=https",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=https",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=https&timeout=10000&country=all",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc&protocols=https",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=4&sort_by=lastChecked&sort_type=desc&protocols=https",
     ],
     "socks4": [
+        # ── GitHub repos ────────────────────────────────────────────────────
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
         "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
@@ -188,13 +223,29 @@ PROXY_SOURCE_URLS: Dict[str, List[str]] = {
         "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/socks4.txt",
         "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
         "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/socks4.txt",
+        "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks4.txt",
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt",
+        "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks4_proxies.txt",
+        "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks4/global/socks4_checked.txt",
+        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks4_proxies.txt",
+        # ── Web APIs ────────────────────────────────────────────────────────
         "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks4&timeout=10000&proxy_format=ipport&format=text",
         "https://www.proxy-list.download/api/v1/get?type=socks4",
+        "https://www.proxyscan.io/download?type=socks4",
+        "https://openproxy.space/list/socks4",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks4",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=socks4",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc&protocols=socks4",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=4&sort_by=lastChecked&sort_type=desc&protocols=socks4",
     ],
     "socks5": [
+        # ── GitHub repos ────────────────────────────────────────────────────
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
         "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks5.txt",
@@ -222,10 +273,25 @@ PROXY_SOURCE_URLS: Dict[str, List[str]] = {
         "https://raw.githubusercontent.com/manuGMG/proxy-365/main/SOCKS5.txt",
         "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
         "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/socks5.txt",
+        "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
+        "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks5_proxies.txt",
+        "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
+        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks5_proxies.txt",
+        # ── Web APIs ────────────────────────────────────────────────────────
         "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5&timeout=10000&proxy_format=ipport&format=text",
         "https://www.proxy-list.download/api/v1/get?type=socks5",
+        "https://www.proxyscan.io/download?type=socks5",
+        "https://openproxy.space/list/socks5",
+        "https://spys.me/socks.txt",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks5",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=socks5",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc&protocols=socks5",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=4&sort_by=lastChecked&sort_type=desc&protocols=socks5",
     ],
 }
 
@@ -432,11 +498,57 @@ async def _check_worker(
 # Async URL fetching
 # ---------------------------------------------------------------------------
 
+def _parse_json_proxies(text: str) -> List[str]:
+    """
+    Extract ``IP:PORT`` strings from a JSON response body.
+
+    Handles the two most common API shapes:
+      • geonode  – ``{"data": [{"ip": "...", "port": "..."}, ...]}``
+      • plain array – ``[{"ip": "...", "port": "..."}, ...]``
+                   or ``["ip:port", ...]``
+    Returns an empty list if *text* is not valid JSON or contains no proxies.
+    """
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+
+    items: List = []
+    if isinstance(data, dict):
+        # geonode and similar: look for a top-level list value
+        for key in ("data", "proxies", "proxy", "list", "result", "results"):
+            if isinstance(data.get(key), list):
+                items = data[key]
+                break
+    elif isinstance(data, list):
+        items = data
+
+    proxies: List[str] = []
+    for item in items:
+        if isinstance(item, str) and ":" in item:
+            proxies.append(item.strip())
+        elif isinstance(item, dict):
+            ip = item.get("ip") or item.get("host") or item.get("address") or ""
+            port = item.get("port") or item.get("Port") or ""
+            if ip and port:
+                proxies.append(f"{ip}:{port}")
+    return proxies
+
+
 async def _fetch_url(
     session: aiohttp.ClientSession,
     url: str,
 ) -> List[str]:
-    """Download a proxy list from *url* and return non-empty lines."""
+    """Download a proxy list from *url* and return ``IP:PORT`` strings.
+
+    • JSON responses (detected by content-type or leading ``{``/``[``) are
+      parsed with :func:`_parse_json_proxies` so that API sources like geonode
+      work out of the box.
+    • Plain-text responses are split line-by-line; only the first
+      whitespace-separated token of each line is kept, which handles sources
+      that append country / type metadata after the address
+      (e.g. ``spys.me`` format ``1.2.3.4:8080 HTTP-N-N``).
+    """
     try:
         async with session.get(
             url,
@@ -445,11 +557,24 @@ async def _fetch_url(
         ) as resp:
             resp.raise_for_status()
             text = await resp.text(errors="replace")
-            return [
-                ln.strip()
-                for ln in text.splitlines()
-                if ln.strip() and not ln.strip().startswith("#")
-            ]
+
+            # ── JSON response ────────────────────────────────────────────
+            ct = resp.headers.get("Content-Type", "")
+            stripped = text.lstrip()
+            if "json" in ct or stripped.startswith(("{", "[")):
+                parsed = _parse_json_proxies(text)
+                if parsed:
+                    return parsed
+                # If JSON parsing yields nothing fall through to text parsing
+
+            # ── Plain-text response ──────────────────────────────────────
+            result: List[str] = []
+            for raw_line in text.splitlines():
+                token = raw_line.strip().split()[0] if raw_line.strip() else ""
+                if token and not token.startswith("#"):
+                    result.append(token)
+            return result
+
     except Exception as exc:
         print(f"[!] Failed to fetch {url}: {exc}")
         return []
