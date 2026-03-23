@@ -10,17 +10,21 @@ throughput.  Each proxy is tested against a unique checker URL drawn from a
 rotating pool of ~50 IP-echo services, which spreads the load and avoids
 rate-limits.
 
+When a proxy is confirmed online the tool also gathers general info:
+  • Country, city, and ISP via ipwho.is
+  • Anonymity level (Elite / Anonymous) via httpbin.org/get header inspection
+
 Directory layout (auto-created):
   proxy_lists/
     offline_{type}.txt  – unchecked proxies  format: IP:PORT
-    online_{type}.txt   – working proxies    format: [TYPE]IP:PORT(ResponseTimeMs)
+    online_{type}.txt   – working proxies    format: [TYPE]IP:PORT(Xms)[CC][Anon][ISP]
     fallen_{type}.txt   – dead proxies       format: IP:PORT
 
-Supported types: http, https, socks4, socks5
+Supported types: http, https, socks4, socks4a, socks5, socks5h
 
 Usage examples:
   python proxy_checker.py add --list my_proxies.txt --type http
-  python proxy_checker.py add --urls url_sources.txt --type socks5
+  python proxy_checker.py add --urls url_sources.txt --type socks5h
   python proxy_checker.py fetch --type all
   python proxy_checker.py check --type all
   python proxy_checker.py stats
@@ -44,7 +48,7 @@ from aiohttp_socks import ProxyConnector
 # ---------------------------------------------------------------------------
 
 PROXY_LISTS_DIR = Path("proxy_lists")
-PROXY_TYPES = ["http", "https", "socks4", "socks5"]
+PROXY_TYPES = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"]
 
 # ~50 IP-echo services used to verify each proxy.
 # Each proxy is assigned exactly one URL from this pool (round-robin).
@@ -293,6 +297,86 @@ PROXY_SOURCE_URLS: Dict[str, List[str]] = {
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc&protocols=socks5",
         "https://proxylist.geonode.com/api/proxy-list?limit=500&page=4&sort_by=lastChecked&sort_type=desc&protocols=socks5",
     ],
+    # socks4a = SOCKS4 with remote hostname resolution.
+    # Public scrapers don't always separate socks4 / socks4a, so we reuse
+    # the same raw lists — any SOCKS4 server that supports domain lookup
+    # will work here too.
+    "socks4a": [
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks4.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS4.txt",
+        "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks4_proxies.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt",
+        "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
+        "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks4.txt",
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt",
+        "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks4/global/socks4_checked.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks4&timeout=10000&proxy_format=ipport&format=text",
+        "https://www.proxy-list.download/api/v1/get?type=socks4",
+        "https://www.proxyscan.io/download?type=socks4",
+        "https://openproxy.space/list/socks4",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks4",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=socks4",
+    ],
+    # socks5h = SOCKS5 with remote DNS resolution.
+    # Same raw sources as socks5 — any SOCKS5 server can be used as socks5h.
+    "socks5h": [
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks5.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS5.txt",
+        "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/Volodichev/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks5_proxies.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
+        "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/manuGMG/proxy-365/main/SOCKS5.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
+        "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
+        "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
+        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks5_proxies.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5&timeout=10000&proxy_format=ipport&format=text",
+        "https://www.proxy-list.download/api/v1/get?type=socks5",
+        "https://www.proxyscan.io/download?type=socks5",
+        "https://openproxy.space/list/socks5",
+        "https://spys.me/socks.txt",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks5",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=socks5",
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -379,12 +463,18 @@ def setup_directories() -> None:
 
 _TYPE_PREFIX_RE = re.compile(r"^\[.*?\]")
 _RESPONSE_TIME_RE = re.compile(r"\(.*?\)$")
+_BRACKET_SUFFIX_RE = re.compile(r"(\[[^\]]*\])+$")
 
 
 def strip_decorations(entry: str) -> str:
-    """Remove [TYPE] prefix and (ResponseTime) suffix from an entry."""
-    entry = _TYPE_PREFIX_RE.sub("", entry).strip()
-    entry = _RESPONSE_TIME_RE.sub("", entry).strip()
+    """Remove all decorations from a stored proxy entry, leaving only IP:PORT.
+
+    Handles the full stored format:
+      ``[TYPE]IP:PORT(Xms)[COUNTRY][ANONYMITY][ISP]``
+    """
+    entry = _TYPE_PREFIX_RE.sub("", entry).strip()    # remove leading [TYPE]
+    entry = _BRACKET_SUFFIX_RE.sub("", entry).strip() # remove [COUNTRY][...] suffixes
+    entry = _RESPONSE_TIME_RE.sub("", entry).strip()  # remove (Xms) suffix
     return entry
 
 
@@ -422,12 +512,14 @@ async def check_proxy(
     """
     Asynchronously attempt to reach *checker_url* through the proxy at ip:port.
     Returns (success, response_time_ms).
+
+    Supported proxy types: http, https, socks4, socks4a, socks5, socks5h.
     """
     proxy_url = f"{proxy_type}://{ip}:{port}"
     client_timeout = aiohttp.ClientTimeout(total=timeout)
     start = time.monotonic()
     try:
-        if proxy_type in ("socks4", "socks5"):
+        if proxy_type in ("socks4", "socks4a", "socks5", "socks5h"):
             connector = ProxyConnector.from_url(proxy_url, ssl=False)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(
@@ -457,6 +549,106 @@ async def check_proxy(
     return False, 0.0
 
 
+# ---------------------------------------------------------------------------
+# Constants for geo-lookup and anonymity checking
+# ---------------------------------------------------------------------------
+
+# URL used to detect proxy-revealing headers (anonymity check).
+_ANONYMITY_CHECK_URL = "https://httpbin.org/get"
+
+# Headers that indicate a non-Elite proxy when forwarded to the server.
+_ANONYMITY_PROXY_HEADERS = frozenset({
+    "X-Forwarded-For", "X-Real-Ip", "Via", "Proxy-Connection",
+    "Forwarded", "X-Proxy-Id", "X-Forwarded-Host",
+})
+
+# Semaphore to avoid flooding free geo-lookup and anonymity-check services.
+_GEO_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_geo_semaphore() -> asyncio.Semaphore:
+    global _GEO_SEMAPHORE
+    if _GEO_SEMAPHORE is None:
+        _GEO_SEMAPHORE = asyncio.Semaphore(15)
+    return _GEO_SEMAPHORE
+
+
+async def _geo_lookup(ip: str) -> Dict[str, str]:
+    """
+    Retrieve geographic and network information for *ip* using ipwho.is.
+    Returns a dict with keys: ``country_code``, ``country``, ``city``, ``isp``.
+    Falls back to empty strings on any error.
+    """
+    result = {"country_code": "", "country": "", "city": "", "isp": ""}
+    async with _get_geo_semaphore():
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(
+                    f"https://ipwho.is/{ip}",
+                    timeout=aiohttp.ClientTimeout(total=8),
+                    ssl=False,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        result["country_code"] = data.get("country_code") or ""
+                        result["country"] = data.get("country") or ""
+                        result["city"] = data.get("city") or ""
+                        result["isp"] = (
+                            data.get("connection", {}).get("isp")
+                            or data.get("org")
+                            or ""
+                        )
+        except Exception:
+            pass
+    return result
+
+
+async def _anonymity_check(
+    ip: str,
+    port: int,
+    proxy_type: str,
+    timeout: int,
+) -> str:
+    """
+    Detect the anonymity level of a proxy by requesting
+    ``https://httpbin.org/get`` through it and inspecting the headers
+    the server received.
+
+    Returns one of:
+      ``"Elite"``     – no proxy-revealing headers forwarded
+      ``"Anonymous"`` – proxy-type headers present but no client IP leaked
+      ``"Unknown"``   – could not reach the check endpoint
+    """
+    PROXY_HEADERS = {"X-Forwarded-For", "X-Real-Ip", "Via", "Proxy-Connection",
+                     "Forwarded", "X-Proxy-Id", "X-Forwarded-Host"}
+    proxy_url = f"{proxy_type}://{ip}:{port}"
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with _get_geo_semaphore():
+        try:
+            if proxy_type in ("socks4", "socks4a", "socks5", "socks5h"):
+                connector = ProxyConnector.from_url(proxy_url, ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(
+                        _ANONYMITY_CHECK_URL, timeout=client_timeout, ssl=False
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+            else:
+                connector = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(
+                        _ANONYMITY_CHECK_URL, proxy=proxy_url, timeout=client_timeout, ssl=False
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+
+            received_headers = set(data.get("headers", {}).keys())
+            if received_headers & _ANONYMITY_PROXY_HEADERS:
+                return "Anonymous"
+            return "Elite"
+        except Exception:
+            return "Unknown"
+
+
 async def _check_worker(
     raw: str,
     proxy_type: str,
@@ -482,9 +674,27 @@ async def _check_worker(
         await remove_proxy(offline, raw)
 
         if success:
-            entry = f"[{proxy_type.upper()}]{ip}:{port}({ms}ms)"
+            # Gather geo and anonymity info concurrently.
+            geo, anon = await asyncio.gather(
+                _geo_lookup(ip),
+                _anonymity_check(ip, port, proxy_type, timeout),
+            )
+            country = geo["country_code"] or "??"
+            isp = geo["isp"]
+            entry = f"[{proxy_type.upper()}]{ip}:{port}({ms}ms)[{country}][{anon}]"
+            if isp:
+                entry += f"[{isp}]"
             await append_proxy(online, entry)
-            print(f"[+] ONLINE  {ip}:{port}  {ms:.0f} ms  ({proxy_type.upper()})")
+
+            geo_str = f"  {country}"
+            if geo["city"]:
+                geo_str += f", {geo['city']}"
+            if isp:
+                geo_str += f"  {isp}"
+            print(
+                f"[+] ONLINE  {ip}:{port}  {ms:.0f} ms  ({proxy_type.upper()})"
+                f"  [{anon}]{geo_str}"
+            )
             counters["online"] += 1
         else:
             await append_proxy(fallen, bare)
@@ -570,7 +780,8 @@ async def _fetch_url(
             # ── Plain-text response ──────────────────────────────────────
             result: List[str] = []
             for raw_line in text.splitlines():
-                token = raw_line.strip().split()[0] if raw_line.strip() else ""
+                line = raw_line.strip()
+                token = line.split()[0] if line else ""
                 if token and not token.startswith("#"):
                     result.append(token)
             return result
@@ -801,7 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=PROXY_TYPES,
         required=True,
         metavar="TYPE",
-        help="Proxy type: http | https | socks4 | socks5",
+        help="Proxy type: http | https | socks4 | socks4a | socks5 | socks5h",
     )
 
     # -- fetch --
