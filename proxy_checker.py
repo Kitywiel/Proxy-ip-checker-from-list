@@ -1420,7 +1420,12 @@ async def check_proxies(
 def add_from_list(source_file: str, proxy_type: str) -> None:
     """
     Import proxies from a local file into offline_{proxy_type}.txt.
-    Duplicates (across all three lists) are silently ignored.
+
+    Proxies already confirmed online are skipped (they work fine).
+    Proxies already in the offline queue are skipped (already pending).
+    Proxies in the fallen list ARE re-imported — a source list re-listing
+    them is a signal they may have recovered.  They are removed from fallen
+    and placed back in offline for a fresh check.
     """
     src = Path(source_file)
     if not src.exists():
@@ -1428,14 +1433,17 @@ def add_from_list(source_file: str, proxy_type: str) -> None:
 
     raw_lines = read_proxies(src)
     offline = PROXY_LISTS_DIR / f"offline_{proxy_type}.txt"
-    online = PROXY_LISTS_DIR / f"online_{proxy_type}.txt"
-    fallen = PROXY_LISTS_DIR / f"fallen_{proxy_type}.txt"
+    online  = PROXY_LISTS_DIR / f"online_{proxy_type}.txt"
+    fallen  = PROXY_LISTS_DIR / f"fallen_{proxy_type}.txt"
 
     existing_offline = set(read_proxies(offline))
-    already_online = {strip_decorations(e) for e in read_proxies(online)}
-    already_fallen = set(read_proxies(fallen))
+    already_online   = {strip_decorations(e) for e in read_proxies(online)}
+    fallen_entries   = read_proxies(fallen)
+    already_fallen   = {strip_decorations(e) for e in fallen_entries}
 
     added = 0
+    revived = 0
+    to_remove_from_fallen: set = set()
     for line in raw_lines:
         parsed = parse_proxy(line)
         if parsed is None:
@@ -1443,13 +1451,24 @@ def add_from_list(source_file: str, proxy_type: str) -> None:
             continue
         ip, port = parsed
         bare = f"{ip}:{port}"
-        if bare in existing_offline or bare in already_online or bare in already_fallen:
+        if bare in existing_offline or bare in already_online:
             continue
         existing_offline.add(bare)
         added += 1
+        if bare in already_fallen:
+            to_remove_from_fallen.add(bare)
+            revived += 1
 
     write_proxies(offline, sorted(existing_offline))
-    print(f"[*] Added {added} new {proxy_type.upper()} proxies to {offline}")
+    if to_remove_from_fallen:
+        write_proxies(fallen, [
+            e for e in fallen_entries
+            if strip_decorations(e) not in to_remove_from_fallen
+        ])
+    msg = f"[*] Added {added} new {proxy_type.upper()} proxies to {offline.name}"
+    if revived:
+        msg += f"  ({revived} revived from fallen)"
+    print(msg)
 
 
 async def add_from_urls(urls_file: str, proxy_type: str) -> None:
