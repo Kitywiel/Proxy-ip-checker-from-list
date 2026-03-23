@@ -133,9 +133,8 @@ def _install_error_handlers() -> None:
 
 PROXY_LISTS_DIR = Path("proxy_lists")
 PROXY_TYPES = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"]
-
 # ~100 IP-echo services used to verify each proxy.
-# Each proxy is assigned exactly one URL from this pool (round-robin).
+# Each proxy gets exactly one URL (round-robin). One check per proxy.
 # Grouped: plain-text IP, JSON IP, HTTP fallbacks.
 CHECKER_URLS: List[str] = [
     # ── Plain-text IP response (fastest — no JSON parsing needed) ────────────
@@ -798,11 +797,11 @@ def flush_write_buffer() -> int:
     """Flush all dirty cache entries to disk right now.
 
     Returns the number of files successfully written.
-    Called automatically by the background flusher task, and also
-    explicitly at the end of each check cycle and on program exit.
+    Resets _checked_since_flush so the count-based trigger restarts.
     """
-    global _last_flush_time
+    global _last_flush_time, _checked_since_flush
     _last_flush_time = time.monotonic()
+    _checked_since_flush = 0
     if not _mem_dirty:
         return 0
     dirty_snapshot = list(_mem_dirty)
@@ -821,25 +820,24 @@ def flush_write_buffer() -> int:
 
 
 async def _buffer_flusher_task() -> None:
-    """Background asyncio task: flush dirty files every
-    BUFFER_FLUSH_INTERVAL seconds or when buffered data exceeds
-    BUFFER_FLUSH_SIZE_KB kilobytes — whichever comes first.
+    """Background asyncio task: flush dirty files every BUFFER_FLUSH_INTERVAL
+    seconds OR after BUFFER_FLUSH_EVERY_N proxies have been scanned —
+    whichever comes first.
     """
     global _last_flush_time
     _last_flush_time = time.monotonic()
     while True:
-        await asyncio.sleep(5)          # lightweight poll every 5 s
-        elapsed  = time.monotonic() - _last_flush_time
-        size_kb  = _cache_size_bytes() / 1024
-        due_time = elapsed >= BUFFER_FLUSH_INTERVAL
-        due_size = size_kb >= BUFFER_FLUSH_SIZE_KB
-        if (due_time or due_size) and _mem_dirty:
+        await asyncio.sleep(5)
+        elapsed   = time.monotonic() - _last_flush_time
+        due_time  = elapsed >= BUFFER_FLUSH_INTERVAL
+        due_count = _checked_since_flush >= BUFFER_FLUSH_EVERY_N
+        if (due_time or due_count) and _mem_dirty:
             n  = flush_write_buffer()
             ts = time.strftime("%H:%M:%S")
-            reason = "size" if due_size else "timer"
+            reason = "count" if due_count else "timer"
             print(
                 f"[~] [{ts}] Flushed {n} file(s) to disk  "
-                f"({size_kb:.1f} KB, {elapsed:.0f}s elapsed, reason={reason})"
+                f"({_checked_since_flush} scanned, {elapsed:.0f}s elapsed, reason={reason})"
             )
 
 
@@ -1143,28 +1141,35 @@ async def _check_worker(
     checker_url: str,
     timeout: int,
     semaphore: asyncio.Semaphore,
-    offline: Path,
     online: Path,
     fallen: Path,
     counters: Dict[str, int],
+    http_session: Optional[aiohttp.ClientSession] = None,
+    geo_session: Optional[aiohttp.ClientSession] = None,
 ) -> None:
-    """Async worker: test one proxy and update the three list files."""
+    """Async worker: test one proxy against one checker URL.
+
+    Each proxy gets exactly one checker URL (round-robin across the pool).
+    The offline list is NOT modified here; check_proxies bulk-clears it
+    after the whole batch completes, avoiding O(n²) per-proxy rewrites.
+    _checked_since_flush is incremented so the background flusher knows
+    when 1000 proxies have been processed and triggers a disk write.
+    """
+    global _checked_since_flush
     async with semaphore:
         parsed = parse_proxy(raw)
         if parsed is None:
-            await remove_proxy(offline, raw)
             return
 
         ip, port = parsed
         bare = f"{ip}:{port}"
-        success, ms = await check_proxy(ip, port, proxy_type, checker_url, timeout)
-
-        await remove_proxy(offline, raw)
+        success, ms = await check_proxy(
+            ip, port, proxy_type, checker_url, timeout, http_session
+        )
 
         if success:
-            # Gather geo and anonymity info concurrently.
             geo, anon = await asyncio.gather(
-                _geo_lookup(ip),
+                _geo_lookup(ip, geo_session),
                 _anonymity_check(ip, port, proxy_type, timeout),
             )
             country = geo["country_code"] or "??"
@@ -1214,6 +1219,7 @@ async def _check_worker(
                     print(f"[!] DB write failed for {bare}: {exc}")
 
         counters["checked"] += 1
+        _checked_since_flush += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1310,59 +1316,103 @@ async def _fetch_url(
 async def check_proxies(
     proxy_type: str,
     timeout: int = 10,
-    max_workers: int = 200,
+    max_workers: int = 500,
 ) -> None:
     """
-    Read all proxies from offline_{proxy_type}.txt, test each one
-    asynchronously, then:
-      - working → online_{proxy_type}.txt  as [TYPE]IP:PORT(Xms)
+    Read all unchecked proxies from offline_{proxy_type}.txt, test each one
+    asynchronously (one checker URL per proxy, round-robin), then:
+      - working → online_{proxy_type}.txt  as [TYPE]IP:PORT(Xms)[CC][Anon][ISP]
       - dead    → fallen_{proxy_type}.txt  as IP:PORT
-    Tested proxies are removed from the offline list.
-    Results are also written to the SQLite database (if aiosqlite is installed).
+
+    Check-once guarantee: any proxy already present in the online or fallen
+    list is silently skipped — it will never be re-tested.
+
+    Processes up to SCAN_BATCH_SIZE proxies per asyncio.gather call so that
+    Task-object RAM stays bounded even with 800k+ input proxies.
+
+    Uses one shared aiohttp.ClientSession per role (HTTP proxy checks / geo
+    lookups) to avoid creating and tearing down a connection for every proxy.
+
+    The offline list is bulk-cleared after all batches complete (O(1) instead
+    of O(n²) per-worker removes).  Results are also written to SQLite if
+    aiosqlite is installed.
     """
     await _init_db_once()
 
     offline = PROXY_LISTS_DIR / f"offline_{proxy_type}.txt"
-    online = PROXY_LISTS_DIR / f"online_{proxy_type}.txt"
-    fallen = PROXY_LISTS_DIR / f"fallen_{proxy_type}.txt"
+    online  = PROXY_LISTS_DIR / f"online_{proxy_type}.txt"
+    fallen  = PROXY_LISTS_DIR / f"fallen_{proxy_type}.txt"
 
-    proxies = read_proxies(offline)
-    if not proxies:
-        print(f"[i] No unchecked proxies in {offline}")
+    all_offline = read_proxies(offline)
+    if not all_offline:
+        print(f"[i] No unchecked proxies in {offline.name}")
         return
 
-    print(f"[*] Checking {len(proxies)} {proxy_type.upper()} proxies …")
+    # ── Check-once: skip anything already in online or fallen ──────────────
+    already_done: set = {strip_decorations(e) for e in read_proxies(online)}
+    already_done |= set(read_proxies(fallen))
+    proxies = [p for p in all_offline if strip_decorations(p) not in already_done]
+    skipped = len(all_offline) - len(proxies)
+    if skipped:
+        print(f"[i] Skipped {skipped} already-checked {proxy_type.upper()} proxies.")
+    if not proxies:
+        print(f"[i] Nothing new to check for {proxy_type.upper()}.")
+        return
 
-    # Assign each proxy a unique checker URL (round-robin over a shuffled pool)
+    total = len(proxies)
+    print(f"[*] Checking {total} {proxy_type.upper()} proxies "
+          f"(batches of {SCAN_BATCH_SIZE}, {max_workers} workers) …")
+
+    # Shuffle the checker URL pool once; assign round-robin per proxy index.
     pool = CHECKER_URLS.copy()
     random.shuffle(pool)
+    n_pool = len(pool)
 
     semaphore = asyncio.Semaphore(max_workers)
     counters: Dict[str, int] = {"checked": 0, "online": 0, "fallen": 0}
 
-    tasks = [
-        _check_worker(
-            raw=raw,
-            proxy_type=proxy_type,
-            checker_url=pool[i % len(pool)],
-            timeout=timeout,
-            semaphore=semaphore,
-            offline=offline,
-            online=online,
-            fallen=fallen,
-            counters=counters,
-        )
-        for i, raw in enumerate(proxies)
-    ]
+    # Shared sessions — one TCPConnector each, reused across all workers.
+    http_connector = aiohttp.TCPConnector(ssl=False, limit=0, ttl_dns_cache=300)
+    geo_connector  = aiohttp.TCPConnector(ssl=False, limit=100, ttl_dns_cache=300)
+    http_session = aiohttp.ClientSession(connector=http_connector)
+    geo_session  = aiohttp.ClientSession(connector=geo_connector)
 
-    await asyncio.gather(*tasks)
+    try:
+        # ── Process in batches to cap Task-object RAM ───────────────────────
+        for batch_start in range(0, total, SCAN_BATCH_SIZE):
+            batch = proxies[batch_start : batch_start + SCAN_BATCH_SIZE]
+            tasks = [
+                _check_worker(
+                    raw=raw,
+                    proxy_type=proxy_type,
+                    checker_url=pool[(batch_start + i) % n_pool],
+                    timeout=timeout,
+                    semaphore=semaphore,
+                    online=online,
+                    fallen=fallen,
+                    counters=counters,
+                    http_session=http_session,
+                    geo_session=geo_session,
+                )
+                for i, raw in enumerate(batch)
+            ]
+            await asyncio.gather(*tasks)
 
-    # Persist everything accumulated during this check cycle.
+            done = min(batch_start + SCAN_BATCH_SIZE, total)
+            print(f"[*] Progress: {done}/{total} checked "
+                  f"({counters['online']} online, {counters['fallen']} fallen)")
+
+    finally:
+        # Always close shared sessions and bulk-clear the offline list.
+        await http_session.close()
+        await geo_session.close()
+        write_proxies(offline, [])   # bulk clear — O(1) vs O(n²) per-worker
+
     n_flushed = flush_write_buffer()
     print(
         f"\n[*] {proxy_type.upper()} — checked {counters['checked']}: "
         f"{counters['online']} online, {counters['fallen']} fallen"
-        + (f"  ({n_flushed} file(s) flushed to disk)" if n_flushed else "")
+        + (f"  ({n_flushed} file(s) flushed)" if n_flushed else "")
         + ".\n"
     )
 
@@ -1591,25 +1641,41 @@ async def run_loop(
     skip_check: bool = False,
     token: Optional[str] = None,
     timeout: int = 10,
-    workers: int = 200,
+    workers: int = 500,
 ) -> None:
-    """Run :func:`run_pipeline` in an infinite loop, sleeping *interval* seconds between
-    cycles.  Press Ctrl+C to stop gracefully.
+    """Run :func:`run_pipeline` forever, sleeping *interval* seconds between
+    cycles.  Every pipeline error is caught, logged, and retried with
+    exponential backoff — the loop never dies on its own.  Ctrl+C stops it.
     """
     cycle = 0
+    consecutive_errors = 0
     while True:
         cycle += 1
         print(f"\n{'─' * 62}")
         print(f"  RUN CYCLE #{cycle}  —  {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'─' * 62}")
-        await run_pipeline(
-            skip_fetch=skip_fetch,
-            skip_repos=skip_repos,
-            skip_check=skip_check,
-            token=token,
-            timeout=timeout,
-            workers=workers,
-        )
+        try:
+            await run_pipeline(
+                skip_fetch=skip_fetch,
+                skip_repos=skip_repos,
+                skip_check=skip_check,
+                token=token,
+                timeout=timeout,
+                workers=workers,
+            )
+            consecutive_errors = 0
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            consecutive_errors += 1
+            wait = min(60 * consecutive_errors, 600)   # up to 10 min backoff
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            msg = f"Pipeline error in cycle #{cycle}: {exc}"
+            print(f"\n[!] [{ts}] {msg}  — retrying in {wait}s …", flush=True)
+            _log.error("%s\n%s", msg, traceback.format_exc())
+            await asyncio.sleep(wait)
+            continue
+
         hrs, rem = divmod(interval, 3600)
         mins, secs = divmod(rem, 60)
         interval_str = (
