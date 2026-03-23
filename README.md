@@ -10,13 +10,14 @@ A **zero-setup** async Python tool that mines, checks, and manages proxy lists �
 python proxy_checker.py
 ```
 
-That's it. Missing packages (`aiohttp`, `aiohttp-socks`) are detected and installed automatically with `python -m pip` before the tool starts. No manual `pip install` required.
+That's it. Missing packages (`aiohttp`, `aiohttp-socks`, `aiosqlite`) are detected and installed automatically with `python -m pip` before the tool starts. No manual `pip install` required.
 
 ---
 
 ## Features
 
-* **Zero-setup** – missing dependencies are auto-installed on first run using `python -m pip`.
+* **Zero-setup** – missing dependencies (`aiohttp`, `aiohttp-socks`, `aiosqlite`) are auto-installed on first run using `python -m pip`.
+* **CDN / false-positive filter** – the proxy check validates that the IP-echo service response actually contains an IPv4 address. CDN block pages, captcha challenges, and Cloudflare landing pages that intercept the connection return HTML without a bare IP and are rejected even when the HTTP status is 200.
 * **Four input sources**
   * A local text file (one `IP:PORT` per line) via `add --list`
   * A file of URLs (plain raw URLs *or* `https://github.com/{owner}/{repo}` lines auto-expanded via the GitHub API) via `add --urls`
@@ -234,7 +235,21 @@ A connection banner at the top shows whether the server is reachable. You can ch
 python tor_service.py
 ```
 
-Exposes the web dashboard as a Tor `.onion` address (requires Tor to be installed and `stem` — auto-installed on run).
+Zero setup — `stem` is auto-installed if missing. Exposes the web dashboard as a Tor `.onion` address.
+
+**Tor itself must be installed separately:**
+
+| Platform | Command |
+|----------|---------|
+| Debian / Ubuntu | `sudo apt-get install tor` |
+| macOS | `brew install tor` |
+| Windows | Download the [Expert Bundle](https://www.torproject.org/download/tor/) and either add the `Tor\` folder to PATH or place it next to `tor_service.py` |
+
+The script automatically:
+1. Tries to connect to any already-running Tor instance (Tor Browser on port 9151, system Tor on port 9051) — no new process is launched if one is found.
+2. Searches common Windows installation paths (`Tor Browser`, Expert Bundle folders) so `tor.exe` does not need to be in PATH.
+3. Launches a new Tor process only when no running instance is found.
+4. Wraps the launch in a clear error handler with actionable troubleshooting hints.
 
 ---
 
@@ -245,3 +260,4 @@ Exposes the web dashboard as a Tor `.onion` address (requires Tor to be installe
 * The checker URL pool is shuffled before each run so URL assignment varies between sessions.
 * Geo and anonymity lookups are rate-limited to 15 concurrent requests to respect free-tier limits of ipwho.is and httpbin.org.
 * Set `GITHUB_TOKEN` for the higher 5 000 req/hour GitHub API rate limit (default: 60 req/hour unauthenticated).
+* The SQLite database (`proxy_lists/proxies.db`) uses a single shared connection with WAL journal mode and an asyncio write-lock so concurrent checker workers never produce "database is locked" errors.

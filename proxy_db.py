@@ -21,17 +21,41 @@ Primary key: (ip, port, proxy_type)
 """
 
 import asyncio
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Zero-setup: auto-install aiosqlite if missing
+# ---------------------------------------------------------------------------
 
 try:
     import aiosqlite
     _AIOSQLITE_AVAILABLE = True
 except ImportError:
-    _AIOSQLITE_AVAILABLE = False
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "aiosqlite>=0.19.0"]
+        )
+        import aiosqlite  # noqa: F811
+        _AIOSQLITE_AVAILABLE = True
+    except Exception:
+        _AIOSQLITE_AVAILABLE = False
 
 DB_PATH = Path("proxy_lists") / "proxies.db"
+
+# ---------------------------------------------------------------------------
+# Shared persistent connection (eliminates "database is locked" under load)
+#
+# All async writes go through _db_conn serialised by _db_write_lock.
+# WAL journal mode allows concurrent reads from other connections (e.g. the
+# web server) without blocking or being blocked by these writes.
+# ---------------------------------------------------------------------------
+
+_db_conn: Optional[Any] = None       # aiosqlite.Connection, set by init_db()
+_db_write_lock: Optional[asyncio.Lock] = None  # created lazily in init_db()
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS proxies (
@@ -59,10 +83,6 @@ _CREATE_IDX_TYPE = (
     "CREATE INDEX IF NOT EXISTS idx_type ON proxies(proxy_type);"
 )
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -80,14 +100,37 @@ def _check_dep() -> None:
 # ---------------------------------------------------------------------------
 
 async def init_db(path: Path = DB_PATH) -> None:
-    """Create the database file and tables if they do not exist."""
+    """Create the database file and tables, and open the shared connection."""
+    global _db_conn, _db_write_lock
     _check_dep()
     path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(path) as db:
-        await db.execute(_CREATE_TABLE)
-        await db.execute(_CREATE_IDX_STATUS)
-        await db.execute(_CREATE_IDX_TYPE)
-        await db.commit()
+
+    # Create the lock once per event-loop lifetime.
+    if _db_write_lock is None:
+        _db_write_lock = asyncio.Lock()
+
+    # Open a single persistent connection used for all writes.
+    if _db_conn is None:
+        _db_conn = await aiosqlite.connect(str(path))
+        # WAL mode: readers never block writers, writers never block readers.
+        await _db_conn.execute("PRAGMA journal_mode=WAL")
+        # Wait up to 30 s before giving up on a locked write (safety net).
+        await _db_conn.execute("PRAGMA busy_timeout=30000")
+        await _db_conn.execute(_CREATE_TABLE)
+        await _db_conn.execute(_CREATE_IDX_STATUS)
+        await _db_conn.execute(_CREATE_IDX_TYPE)
+        await _db_conn.commit()
+
+
+async def close_db() -> None:
+    """Close the shared persistent connection gracefully."""
+    global _db_conn
+    if _db_conn is not None:
+        try:
+            await _db_conn.close()
+        except Exception:
+            pass
+        _db_conn = None
 
 
 async def upsert_proxy(
@@ -101,21 +144,25 @@ async def upsert_proxy(
     isp: str = "",
     anonymity: str = "",
     response_ms: float = 0.0,
-    path: Path = DB_PATH,
+    path: Path = DB_PATH,        # kept for API compatibility; ignored when shared conn is open
 ) -> None:
     """
     Insert a new proxy row or update the existing one.
+
+    All writes are serialised through the shared connection opened by
+    init_db() to prevent "database is locked" errors under heavy concurrency.
 
     - ``first_seen`` is only written on INSERT; it is never updated.
     - ``last_online`` is updated only when ``status == "online"``.
     """
     _check_dep()
+    if _db_conn is None or _db_write_lock is None:
+        return  # init_db() was not called; silently skip
     now = _now()
     last_online = now if status == "online" else ""
 
-    async with aiosqlite.connect(path) as db:
-        # Try INSERT first (preserves first_seen).
-        await db.execute(
+    async with _db_write_lock:
+        await _db_conn.execute(
             """
             INSERT INTO proxies
                 (ip, port, proxy_type, status, country_code, country, city,
@@ -152,7 +199,7 @@ async def upsert_proxy(
                 now, now, last_online,
             ),
         )
-        await db.commit()
+        await _db_conn.commit()
 
 
 async def get_all_proxies(

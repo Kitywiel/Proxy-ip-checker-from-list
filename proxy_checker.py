@@ -73,6 +73,7 @@ def _bootstrap_deps() -> None:
     _required = [
         ("aiohttp",        "aiohttp>=3.9.0"),
         ("aiohttp_socks",  "aiohttp-socks>=0.8.0"),
+        ("aiosqlite",      "aiosqlite>=0.19.0"),
     ]
     missing = []
     for module, pkg_spec in _required:
@@ -994,6 +995,9 @@ async def _init_db_once() -> None:
 _TYPE_PREFIX_RE = re.compile(r"^\[.*?\]")
 _RESPONSE_TIME_RE = re.compile(r"\(.*?\)$")
 _BRACKET_SUFFIX_RE = re.compile(r"(\[[^\]]*\])+$")
+# Used to validate that a checker-URL response body actually contains an IPv4
+# address.  CDN error pages, captcha blocks and landing pages don't.
+_IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
 
 def strip_decorations(entry: str) -> str:
@@ -1052,6 +1056,12 @@ async def check_proxy(
     goes through a different proxy via the ``proxy=`` parameter).
     SOCKS proxies require a per-request ProxyConnector and always create their
     own short-lived session.
+
+    Response-body validation: the body must contain at least one IPv4 address.
+    All legitimate IP-echo services return the client's IP in their response
+    (plain text, JSON, or key=value).  CDN block pages, captcha challenges,
+    and misconfigured hosts that intercept the connection return HTML without
+    a bare IP address, so they are rejected even when the HTTP status is 200.
     """
     proxy_url = f"{proxy_type}://{ip}:{port}"
     client_timeout = aiohttp.ClientTimeout(total=timeout)
@@ -1068,7 +1078,9 @@ async def check_proxy(
                 ) as resp:
                     elapsed_ms = (time.monotonic() - start) * 1000.0
                     if 200 <= resp.status < 300:
-                        return True, round(elapsed_ms, 2)
+                        body = await resp.content.read(8192)
+                        if _IP_PATTERN.search(body.decode("utf-8", errors="ignore")):
+                            return True, round(elapsed_ms, 2)
         else:
             # HTTP / HTTPS — use the shared session when available so we
             # don't create+destroy a TCPConnector for every single proxy.
@@ -1082,7 +1094,9 @@ async def check_proxy(
                 ) as resp:
                     elapsed_ms = (time.monotonic() - start) * 1000.0
                     if 200 <= resp.status < 300:
-                        return True, round(elapsed_ms, 2)
+                        body = await resp.content.read(8192)
+                        if _IP_PATTERN.search(body.decode("utf-8", errors="ignore")):
+                            return True, round(elapsed_ms, 2)
             else:
                 connector = aiohttp.TCPConnector(ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as session:
@@ -1095,7 +1109,9 @@ async def check_proxy(
                     ) as resp:
                         elapsed_ms = (time.monotonic() - start) * 1000.0
                         if 200 <= resp.status < 300:
-                            return True, round(elapsed_ms, 2)
+                            body = await resp.content.read(8192)
+                            if _IP_PATTERN.search(body.decode("utf-8", errors="ignore")):
+                                return True, round(elapsed_ms, 2)
     except Exception:
         pass
     return False, 0.0
@@ -1274,9 +1290,22 @@ async def _check_worker(
                 f"  [{anon}]{geo_str}"
             )
             counters["online"] += 1
+        else:
+            await append_proxy(fallen, bare)
+            print(f"[-] FALLEN  {ip}:{port}")
+            counters["fallen"] += 1
 
-            if _DB_ENABLED:
-                try:
+        # Mark as checked immediately after the result is committed to the
+        # RAM cache — before any optional DB awaits.  This ensures checked_set
+        # is accurate even if a CancelledError fires during the DB write.
+        counters["checked"] += 1
+        _checked_since_flush += 1
+        if checked_set is not None:
+            checked_set.add(bare)
+
+        if _DB_ENABLED:
+            try:
+                if success:
                     await _proxy_db.upsert_proxy(
                         ip=ip, port=port, proxy_type=proxy_type,
                         status="online",
@@ -1287,26 +1316,13 @@ async def _check_worker(
                         anonymity=anon,
                         response_ms=ms,
                     )
-                except Exception as exc:
-                    print(f"[!] DB write failed for {bare}: {exc}")
-        else:
-            await append_proxy(fallen, bare)
-            print(f"[-] FALLEN  {ip}:{port}")
-            counters["fallen"] += 1
-
-            if _DB_ENABLED:
-                try:
+                else:
                     await _proxy_db.upsert_proxy(
                         ip=ip, port=port, proxy_type=proxy_type,
                         status="fallen",
                     )
-                except Exception as exc:
-                    print(f"[!] DB write failed for {bare}: {exc}")
-
-        counters["checked"] += 1
-        _checked_since_flush += 1
-        if checked_set is not None:
-            checked_set.add(bare)
+            except Exception as exc:
+                print(f"[!] DB write failed for {bare}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1465,6 +1481,7 @@ async def check_proxies(
     http_session = aiohttp.ClientSession(connector=http_connector)
     geo_session  = aiohttp.ClientSession(connector=geo_connector)
 
+    n_flushed = 0
     try:
         # ── Process in batches to cap Task-object RAM ───────────────────────
         for batch_start in range(0, total, SCAN_BATCH_SIZE):
@@ -1497,11 +1514,17 @@ async def check_proxies(
         await geo_session.close()
         write_proxies(offline, [])   # bulk clear — O(1) vs O(n²) per-worker
 
-        # Save any proxies that were not reached (e.g. interrupted mid-run)
-        # to SNTBS-{type}.txt so they are preserved for the next run.
+        # Defence-in-depth: exclude any proxy that is already in the online or
+        # fallen RAM cache even if checked_set was not updated (e.g. a
+        # CancelledError between append_proxy and checked_set.add).
+        already_committed: Set[str] = (
+            {strip_decorations(e) for e in read_proxies(online)}
+            | {strip_decorations(e) for e in read_proxies(fallen)}
+        )
         unchecked = [
             strip_decorations(p) for p in proxies
             if strip_decorations(p) not in checked_set
+            and strip_decorations(p) not in already_committed
         ]
         if unchecked:
             sntbs = Path(f"SNTBS-{proxy_type}.txt")
@@ -1517,7 +1540,11 @@ async def check_proxies(
                 f"proxies to {sntbs.name}"
             )
 
-    n_flushed = flush_write_buffer()
+        # Flush results to disk inside the finally block so they always reach
+        # disk even when an exception (including CancelledError / Ctrl+C)
+        # propagates out of check_proxies.
+        n_flushed = flush_write_buffer()
+
     print(
         f"\n[*] {proxy_type.upper()} — checked {counters['checked']}: "
         f"{counters['online']} online, {counters['fallen']} fallen"
@@ -1651,7 +1678,7 @@ async def _import_from_url_list(urls: List[str], proxy_type: str) -> None:
 
     existing_offline = set(read_proxies(offline))
     already_online = {strip_decorations(e) for e in read_proxies(online)}
-    already_fallen = set(read_proxies(fallen))
+    already_fallen = {strip_decorations(e) for e in read_proxies(fallen)}
 
     connector = aiohttp.TCPConnector(ssl=False, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -2067,6 +2094,11 @@ async def async_main() -> None:
         n = flush_write_buffer()
         if n:
             print(f"[~] Final flush: {n} file(s) written to disk.")
+        if _DB_ENABLED:
+            try:
+                await _proxy_db.close_db()
+            except Exception:
+                pass
 
 
 def main() -> None:
