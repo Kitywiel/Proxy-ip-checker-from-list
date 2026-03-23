@@ -63,6 +63,13 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 from aiohttp_socks import ProxyConnector
 
+# Optional database support (requires aiosqlite).
+try:
+    import proxy_db as _proxy_db
+    _DB_ENABLED = True
+except ImportError:
+    _DB_ENABLED = False
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -578,28 +585,59 @@ async def fetch_github_repos(
 
 
 # ---------------------------------------------------------------------------
-# Async-safe file helpers
+# In-memory write buffer
+#
+# All proxy list file I/O goes through this layer:
+#   • Reads are served from RAM (_mem_cache) after the first disk load.
+#   • Writes update only _mem_cache and mark the path dirty — zero disk I/O.
+#   • A background task (_buffer_flusher_task) persists dirty files to disk
+#     every BUFFER_FLUSH_INTERVAL seconds, or immediately when the total
+#     buffered content exceeds BUFFER_FLUSH_SIZE_KB kilobytes.
+#   • flush_write_buffer() can also be called explicitly (e.g. after a full
+#     check cycle or on graceful shutdown).
+#
+# Because asyncio is cooperative (single-threaded) and append_proxy /
+# remove_proxy contain no ``await`` between their read and write, the
+# read-modify-write is inherently atomic — no per-file locking is needed.
 # ---------------------------------------------------------------------------
 
-_file_locks: Dict[str, asyncio.Lock] = {}
+#: Seconds between automatic flush-to-disk cycles.
+BUFFER_FLUSH_INTERVAL: int = 60
+#: Flush immediately when the RAM buffer exceeds this many megabytes.
+BUFFER_FLUSH_SIZE_KB: int = 10
+
+# resolved-path-string → ordered, deduplicated list of entries (live state)
+_mem_cache: Dict[str, List[str]] = {}
+# resolved-path-strings that have unsaved changes
+_mem_dirty: set = set()
+
+_last_flush_time: float = 0.0          # monotonic timestamp of last flush
+_flusher_handle: Optional[asyncio.Task] = None  # background task reference
 
 
-def _get_lock(path: Path) -> asyncio.Lock:
-    """Return (creating lazily) an asyncio.Lock for *path*.
+def _cache_key(path: Path) -> str:
+    return str(path.resolve())
 
-    Safe to call without any outer lock because asyncio is single-threaded:
-    no other coroutine can interleave between the dict lookup and the
-    assignment (there is no ``await`` in this function).
-    """
-    key = str(path.resolve())
-    if key not in _file_locks:
-        _file_locks[key] = asyncio.Lock()
-    return _file_locks[key]
+
+def _cache_size_bytes() -> int:
+    """Approximate number of bytes held in the RAM cache across all files."""
+    return sum(
+        sum(len(e) + 1 for e in entries)   # +1 for newline per entry
+        for entries in _mem_cache.values()
+    )
 
 
 def read_proxies(path: Path) -> List[str]:
-    """Return deduplicated, non-empty lines from *path* (preserves order)."""
+    """Return deduplicated, non-empty lines for *path*.
+
+    Served from the RAM cache when available; otherwise the file is read
+    from disk, cached, and a copy is returned so callers may mutate freely.
+    """
+    key = _cache_key(path)
+    if key in _mem_cache:
+        return list(_mem_cache[key])      # return a copy
     if not path.exists():
+        _mem_cache[key] = []
         return []
     seen: set = set()
     result: List[str] = []
@@ -608,37 +646,120 @@ def read_proxies(path: Path) -> List[str]:
         if line and not line.startswith("#") and line not in seen:
             seen.add(line)
             result.append(line)
-    return result
+    _mem_cache[key] = result
+    return list(result)
 
 
 def write_proxies(path: Path, proxies: List[str]) -> None:
-    """Write *proxies* to *path*, deduplicating while preserving order."""
+    """Update the RAM cache for *path* and mark it dirty.
+
+    No disk I/O happens here.  The background flusher (or an explicit
+    flush_write_buffer() call) persists the data to disk.
+    """
     seen: set = set()
     unique: List[str] = []
     for p in proxies:
         if p not in seen:
             seen.add(p)
             unique.append(p)
-    path.write_text("\n".join(unique) + ("\n" if unique else ""), encoding="utf-8")
+    key = _cache_key(path)
+    _mem_cache[key] = unique
+    _mem_dirty.add(key)
 
+
+def _flush_one(key: str) -> None:
+    """Atomically write one cached file to disk (temp → os.replace)."""
+    entries = _mem_cache.get(key, [])
+    path = Path(key)
+    content = "\n".join(entries) + ("\n" if entries else "")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def flush_write_buffer() -> int:
+    """Flush all dirty cache entries to disk right now.
+
+    Returns the number of files successfully written.
+    Called automatically by the background flusher task, and also
+    explicitly at the end of each check cycle and on program exit.
+    """
+    global _last_flush_time
+    _last_flush_time = time.monotonic()
+    if not _mem_dirty:
+        return 0
+    dirty_snapshot = list(_mem_dirty)
+    errors: List[str] = []
+    for key in dirty_snapshot:
+        try:
+            _flush_one(key)
+            _mem_dirty.discard(key)
+        except Exception as exc:
+            errors.append(f"  {Path(key).name}: {exc}")
+    if errors:
+        print(f"[!] Flush errors ({len(errors)}):")
+        for e in errors:
+            print(e)
+    return len(dirty_snapshot) - len(errors)
+
+
+async def _buffer_flusher_task() -> None:
+    """Background asyncio task: flush dirty files every
+    BUFFER_FLUSH_INTERVAL seconds or when buffered data exceeds
+    BUFFER_FLUSH_SIZE_KB kilobytes — whichever comes first.
+    """
+    global _last_flush_time
+    _last_flush_time = time.monotonic()
+    while True:
+        await asyncio.sleep(5)          # lightweight poll every 5 s
+        elapsed  = time.monotonic() - _last_flush_time
+        size_kb  = _cache_size_bytes() / 1024
+        due_time = elapsed >= BUFFER_FLUSH_INTERVAL
+        due_size = size_kb >= BUFFER_FLUSH_SIZE_KB
+        if (due_time or due_size) and _mem_dirty:
+            n  = flush_write_buffer()
+            ts = time.strftime("%H:%M:%S")
+            reason = "size" if due_size else "timer"
+            print(
+                f"[~] [{ts}] Flushed {n} file(s) to disk  "
+                f"({size_kb:.1f} KB, {elapsed:.0f}s elapsed, reason={reason})"
+            )
+
+
+def start_buffer_flusher() -> "asyncio.Task[None]":
+    """Schedule the background flusher as an asyncio task.
+
+    Must be called from inside a running event loop (i.e. inside an
+    async function).  Safe to call multiple times — only one task is
+    ever created.
+    """
+    global _flusher_handle
+    if _flusher_handle is None or _flusher_handle.done():
+        _flusher_handle = asyncio.create_task(_buffer_flusher_task())
+    return _flusher_handle
+
+
+# append_proxy / remove_proxy contain no ``await`` between their read and
+# write, so the read-modify-write is atomic from asyncio's perspective.
+# No per-file locking is required.
 
 async def append_proxy(path: Path, entry: str) -> None:
-    """Async-safely append *entry* to *path* if not already present."""
-    lock = _get_lock(path)
-    async with lock:
-        existing = await asyncio.to_thread(read_proxies, path)
-        if entry not in existing:
-            existing.append(entry)
-            await asyncio.to_thread(write_proxies, path, existing)
+    """Append *entry* to the RAM cache for *path* (if not already present).
+    Marks the file dirty — no disk I/O.
+    """
+    existing = read_proxies(path)
+    if entry not in existing:
+        existing.append(entry)
+        write_proxies(path, existing)
 
 
 async def remove_proxy(path: Path, entry: str) -> None:
-    """Async-safely remove *entry* from *path*."""
-    lock = _get_lock(path)
-    async with lock:
-        existing = await asyncio.to_thread(read_proxies, path)
-        updated = [p for p in existing if p != entry]
-        await asyncio.to_thread(write_proxies, path, updated)
+    """Remove *entry* from the RAM cache for *path*.
+    Marks the file dirty — no disk I/O.
+    """
+    existing = read_proxies(path)
+    updated = [p for p in existing if p != entry]
+    write_proxies(path, updated)
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +774,15 @@ def setup_directories() -> None:
             filepath = PROXY_LISTS_DIR / f"{prefix}_{ptype}.txt"
             if not filepath.exists():
                 filepath.touch()
+
+
+async def _init_db_once() -> None:
+    """Initialise the SQLite database (no-op if aiosqlite is not installed)."""
+    if _DB_ENABLED:
+        try:
+            await _proxy_db.init_db()
+        except Exception as exc:
+            print(f"[!] DB init failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -891,10 +1021,34 @@ async def _check_worker(
                 f"  [{anon}]{geo_str}"
             )
             counters["online"] += 1
+
+            if _DB_ENABLED:
+                try:
+                    await _proxy_db.upsert_proxy(
+                        ip=ip, port=port, proxy_type=proxy_type,
+                        status="online",
+                        country_code=geo.get("country_code", ""),
+                        country=geo.get("country", ""),
+                        city=geo.get("city", ""),
+                        isp=geo.get("isp", ""),
+                        anonymity=anon,
+                        response_ms=ms,
+                    )
+                except Exception as exc:
+                    print(f"[!] DB write failed for {bare}: {exc}")
         else:
             await append_proxy(fallen, bare)
             print(f"[-] FALLEN  {ip}:{port}")
             counters["fallen"] += 1
+
+            if _DB_ENABLED:
+                try:
+                    await _proxy_db.upsert_proxy(
+                        ip=ip, port=port, proxy_type=proxy_type,
+                        status="fallen",
+                    )
+                except Exception as exc:
+                    print(f"[!] DB write failed for {bare}: {exc}")
 
         counters["checked"] += 1
 
@@ -1001,7 +1155,10 @@ async def check_proxies(
       - working → online_{proxy_type}.txt  as [TYPE]IP:PORT(Xms)
       - dead    → fallen_{proxy_type}.txt  as IP:PORT
     Tested proxies are removed from the offline list.
+    Results are also written to the SQLite database (if aiosqlite is installed).
     """
+    await _init_db_once()
+
     offline = PROXY_LISTS_DIR / f"offline_{proxy_type}.txt"
     online = PROXY_LISTS_DIR / f"online_{proxy_type}.txt"
     fallen = PROXY_LISTS_DIR / f"fallen_{proxy_type}.txt"
@@ -1037,9 +1194,13 @@ async def check_proxies(
 
     await asyncio.gather(*tasks)
 
+    # Persist everything accumulated during this check cycle.
+    n_flushed = flush_write_buffer()
     print(
         f"\n[*] {proxy_type.upper()} — checked {counters['checked']}: "
-        f"{counters['online']} online, {counters['fallen']} fallen.\n"
+        f"{counters['online']} online, {counters['fallen']} fallen"
+        + (f"  ({n_flushed} file(s) flushed to disk)" if n_flushed else "")
+        + ".\n"
     )
 
 
@@ -1481,61 +1642,73 @@ async def async_main() -> None:
 
     setup_directories()
 
-    # ── run (default when no command given) ────────────────────────────────
-    if args.command in (None, "run"):
-        run_args = args if args.command == "run" else argparse.Namespace(
-            loop=False, interval=3600,
-            skip_fetch=False, skip_repos=False, skip_check=False,
-            token=None, timeout=10, workers=200,
-        )
-        try:
-            if run_args.loop:
-                await run_loop(
-                    interval=run_args.interval,
-                    skip_fetch=run_args.skip_fetch,
-                    skip_repos=run_args.skip_repos,
-                    skip_check=run_args.skip_check,
-                    token=run_args.token,
-                    timeout=run_args.timeout,
-                    workers=run_args.workers,
-                )
+    # Start the background write-buffer flusher (flushes dirty files every
+    # BUFFER_FLUSH_INTERVAL seconds or when buffer exceeds BUFFER_FLUSH_SIZE_KB).
+    start_buffer_flusher()
+
+    try:
+        # ── run (default when no command given) ────────────────────────────
+        if args.command in (None, "run"):
+            run_args = args if args.command == "run" else argparse.Namespace(
+                loop=False, interval=3600,
+                skip_fetch=False, skip_repos=False, skip_check=False,
+                token=None, timeout=10, workers=200,
+            )
+            try:
+                if run_args.loop:
+                    await run_loop(
+                        interval=run_args.interval,
+                        skip_fetch=run_args.skip_fetch,
+                        skip_repos=run_args.skip_repos,
+                        skip_check=run_args.skip_check,
+                        token=run_args.token,
+                        timeout=run_args.timeout,
+                        workers=run_args.workers,
+                    )
+                else:
+                    await run_pipeline(
+                        skip_fetch=run_args.skip_fetch,
+                        skip_repos=run_args.skip_repos,
+                        skip_check=run_args.skip_check,
+                        token=run_args.token,
+                        timeout=run_args.timeout,
+                        workers=run_args.workers,
+                    )
+            except KeyboardInterrupt:
+                print("\n[*] Run stopped by user.")
+
+        elif args.command == "add":
+            if args.list:
+                add_from_list(args.list, args.type)
             else:
-                await run_pipeline(
-                    skip_fetch=run_args.skip_fetch,
-                    skip_repos=run_args.skip_repos,
-                    skip_check=run_args.skip_check,
-                    token=run_args.token,
-                    timeout=run_args.timeout,
-                    workers=run_args.workers,
-                )
-        except KeyboardInterrupt:
-            print("\n[*] Run stopped by user.")
+                await add_from_urls(args.urls, args.type)
 
-    elif args.command == "add":
-        if args.list:
-            add_from_list(args.list, args.type)
-        else:
-            await add_from_urls(args.urls, args.type)
+        elif args.command == "fetch":
+            await fetch_builtin(args.type)
 
-    elif args.command == "fetch":
-        await fetch_builtin(args.type)
+        elif args.command == "repos":
+            if args.list_repos:
+                print(f"\n=== Configured GitHub Repository Sources ({len(GITHUB_REPO_SOURCES)}) ===\n")
+                for url in GITHUB_REPO_SOURCES:
+                    print(f"  {url}")
+                print()
+            else:
+                await fetch_github_repos(args.type, token=args.token)
 
-    elif args.command == "repos":
-        if args.list_repos:
-            print(f"\n=== Configured GitHub Repository Sources ({len(GITHUB_REPO_SOURCES)}) ===\n")
-            for url in GITHUB_REPO_SOURCES:
-                print(f"  {url}")
-            print()
-        else:
-            await fetch_github_repos(args.type, token=args.token)
+        elif args.command == "check":
+            types = PROXY_TYPES if args.type == "all" else [args.type]
+            for ptype in types:
+                await check_proxies(ptype, timeout=args.timeout, max_workers=args.workers)
 
-    elif args.command == "check":
-        types = PROXY_TYPES if args.type == "all" else [args.type]
-        for ptype in types:
-            await check_proxies(ptype, timeout=args.timeout, max_workers=args.workers)
+        elif args.command == "stats":
+            show_stats()
 
-    elif args.command == "stats":
-        show_stats()
+    finally:
+        # Always flush whatever is still in the buffer before exiting,
+        # so no data is lost on normal exit or Ctrl+C.
+        n = flush_write_buffer()
+        if n:
+            print(f"[~] Final flush: {n} file(s) written to disk.")
 
 
 def main() -> None:

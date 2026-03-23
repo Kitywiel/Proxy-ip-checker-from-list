@@ -1,3 +1,9 @@
 aiohttp>=3.9.0
 aiohttp-socks>=0.8.0
 urllib3>=1.26.0
+# Database support (proxy_db.py)
+aiosqlite>=0.19.0
+# Web dashboard (web_server.py)
+flask>=3.0.0
+# Tor hidden service launcher (tor_service.py) — requires Tor to be installed
+stem>=1.8.0
