@@ -2,8 +2,12 @@
 """
 Proxy IP Checker
 ================
-Checks proxies from a local list (option a), from a file of URLs pointing
-to proxy lists (option b), or from the built-in URL database (option c).
+Zero-setup automatic proxy miner and checker.
+
+Run with no arguments to start the full auto-mine pipeline:
+
+  python proxy_checker.py          ← fetch all sources + check all proxies
+  python proxy_checker.py run --loop --interval 1h   ← mine forever
 
 All network I/O runs fully asynchronously (asyncio + aiohttp) for maximum
 throughput.  Each proxy is tested against a unique checker URL drawn from a
@@ -23,19 +27,25 @@ Directory layout (auto-created):
 Supported types: http, https, socks4, socks4a, socks5, socks5h
 
 GitHub auto-discovery:
-  The `repos` command queries the GitHub API for every repo in
-  GITHUB_REPO_SOURCES, discovers all proxy-list .txt files, classifies them
-  by type, and imports the raw content automatically.  Set the GITHUB_TOKEN
-  environment variable for the higher 5 000 req/hour authenticated rate limit
-  (default: 60 req/hour unauthenticated).
+  The `repos` command (and the `run` pipeline) queries the GitHub API for
+  every repo in GITHUB_REPO_SOURCES, discovers all proxy-list .txt files,
+  classifies them by type, and imports the raw content automatically.  Set
+  the GITHUB_TOKEN environment variable for the higher 5 000 req/hour
+  authenticated rate limit (default: 60 req/hour unauthenticated).
 
-Usage examples:
-  python proxy_checker.py add --list my_proxies.txt --type http
-  python proxy_checker.py add --urls url_sources.txt --type socks5h
-  python proxy_checker.py fetch --type all
-  python proxy_checker.py repos --type all
-  python proxy_checker.py repos --list-repos
-  python proxy_checker.py check --type all
+All commands:
+  python proxy_checker.py                      # run (default)
+  python proxy_checker.py run                 # fetch all + check all (once)
+  python proxy_checker.py run --loop          # repeat every hour forever
+  python proxy_checker.py run --interval 30m  # repeat every 30 minutes
+  python proxy_checker.py run --skip-repos    # skip GitHub API step
+  python proxy_checker.py run --skip-check    # only fetch, don't check
+  python proxy_checker.py fetch --type all     # fetch built-in sources only
+  python proxy_checker.py repos --type all     # fetch GitHub repos only
+  python proxy_checker.py repos --list-repos   # list configured repos
+  python proxy_checker.py check --type all     # check offline proxies only
+  python proxy_checker.py add --list FILE --type http
+  python proxy_checker.py add --urls FILE --type socks5h
   python proxy_checker.py stats
 """
 
@@ -1254,6 +1264,121 @@ async def _import_from_url_list(urls: List[str], proxy_type: str) -> None:
     print(f"\n[*] Total added: {total_added} new {proxy_type.upper()} proxies to {offline}\n")
 
 
+def _parse_interval(value: str) -> int:
+    """Convert a human-friendly interval string to an integer number of seconds.
+
+    Accepted formats (case-insensitive):
+      • Plain integer → treated as seconds  (e.g. ``"3600"``)
+      • ``Nd``  → N days                    (e.g. ``"1d"``)
+      • ``Nh``  → N hours                   (e.g. ``"2h"``)
+      • ``Nm``  → N minutes                 (e.g. ``"30m"``)
+      • ``Ns``  → N seconds                 (e.g. ``"90s"``)
+    """
+    s = value.strip().lower()
+    multipliers = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    if s and s[-1] in multipliers:
+        try:
+            return int(s[:-1]) * multipliers[s[-1]]
+        except ValueError:
+            pass
+    try:
+        return int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid interval '{value}'. "
+            "Use an integer (seconds) or a suffix: 30m, 2h, 1d."
+        )
+
+
+async def run_pipeline(
+    skip_fetch: bool = False,
+    skip_repos: bool = False,
+    skip_check: bool = False,
+    token: Optional[str] = None,
+    timeout: int = 10,
+    workers: int = 200,
+) -> None:
+    """Run one full mining cycle for **all** proxy types.
+
+    Pipeline:
+      1. Fetch from 170+ built-in source URLs (``fetch`` step)
+      2. Auto-discover raw files from 50 GitHub repos via the API (``repos`` step)
+      3. Check every offline proxy and enrich online ones with geo + anonymity info
+      4. Print updated statistics
+
+    Any step can be skipped with the corresponding ``skip_*`` flag.
+    """
+    width = 62
+    print("\n" + "=" * width)
+    print("  ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗")
+    print("  ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝")
+    print("  ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ ")
+    print("  ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  ")
+    print("  ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   ")
+    print("  ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝  ")
+    print("  AUTO MINER  —  all 6 proxy types")
+    print("=" * width + "\n")
+
+    step = 1
+    total_steps = sum([not skip_fetch, not skip_repos, not skip_check]) + 1  # +1 for stats
+
+    if not skip_fetch:
+        print(f"[STEP {step}/{total_steps}] Fetching from 170+ built-in sources …")
+        step += 1
+        await fetch_builtin("all")
+
+    if not skip_repos:
+        print(f"[STEP {step}/{total_steps}] Auto-discovering raw files from 50 GitHub repos …")
+        step += 1
+        await fetch_github_repos("all", token=token)
+
+    if not skip_check:
+        print(f"[STEP {step}/{total_steps}] Checking all offline proxies …")
+        step += 1
+        for ptype in PROXY_TYPES:
+            await check_proxies(ptype, timeout=timeout, max_workers=workers)
+
+    print(f"[STEP {step}/{total_steps}] Results:")
+    show_stats()
+
+
+async def run_loop(
+    interval: int,
+    skip_fetch: bool = False,
+    skip_repos: bool = False,
+    skip_check: bool = False,
+    token: Optional[str] = None,
+    timeout: int = 10,
+    workers: int = 200,
+) -> None:
+    """Run :func:`run_pipeline` in an infinite loop, sleeping *interval* seconds between
+    cycles.  Press Ctrl+C to stop gracefully.
+    """
+    cycle = 0
+    while True:
+        cycle += 1
+        print(f"\n{'─' * 62}")
+        print(f"  RUN CYCLE #{cycle}  —  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'─' * 62}")
+        await run_pipeline(
+            skip_fetch=skip_fetch,
+            skip_repos=skip_repos,
+            skip_check=skip_check,
+            token=token,
+            timeout=timeout,
+            workers=workers,
+        )
+        hrs, rem = divmod(interval, 3600)
+        mins, secs = divmod(rem, 60)
+        interval_str = (
+            f"{hrs}h {mins}m {secs}s" if hrs
+            else f"{mins}m {secs}s" if mins
+            else f"{secs}s"
+        )
+        print(f"\n[*] Next cycle in {interval_str}  (Ctrl+C to stop)\n")
+        await asyncio.sleep(interval)
+
+
 def show_stats() -> None:
     """Print a summary table of all proxy list sizes."""
     print("\n=== Proxy List Statistics ===\n")
@@ -1284,6 +1409,62 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    # -- run --  (also the default when no command is supplied)
+    run_p = sub.add_parser(
+        "run",
+        help="Full auto pipeline: fetch all sources → check all proxies [DEFAULT]",
+    )
+    run_p.add_argument(
+        "--loop",
+        action="store_true",
+        help="Repeat the mining cycle indefinitely (use with --interval)",
+    )
+    run_p.add_argument(
+        "--interval",
+        type=_parse_interval,
+        default=3600,
+        metavar="SECS|Nm|Nh",
+        help=(
+            "Time between mining cycles when --loop is set "
+            "(default: 3600).  Accepts: 3600, 60m, 1h, 2d."
+        ),
+    )
+    run_p.add_argument(
+        "--skip-fetch",
+        action="store_true",
+        help="Skip fetching from the 170+ built-in source URLs",
+    )
+    run_p.add_argument(
+        "--skip-repos",
+        action="store_true",
+        help="Skip the GitHub repo auto-discovery step",
+    )
+    run_p.add_argument(
+        "--skip-check",
+        action="store_true",
+        help="Fetch proxies only — skip the checking step",
+    )
+    run_p.add_argument(
+        "--token",
+        metavar="TOKEN",
+        default=None,
+        help="GitHub token for the repos step (overrides GITHUB_TOKEN env var)",
+    )
+    run_p.add_argument(
+        "--timeout", "-T",
+        type=int,
+        default=10,
+        metavar="SECS",
+        help="Per-proxy check timeout in seconds (default: 10)",
+    )
+    run_p.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Max concurrent proxy checks (default: 200)",
+    )
 
     # -- add --
     add_p = sub.add_parser("add", help="Add proxies to an offline list")
@@ -1382,7 +1563,37 @@ async def async_main() -> None:
 
     setup_directories()
 
-    if args.command == "add":
+    # ── run (default when no command given) ────────────────────────────────
+    if args.command in (None, "run"):
+        run_args = args if args.command == "run" else argparse.Namespace(
+            loop=False, interval=3600,
+            skip_fetch=False, skip_repos=False, skip_check=False,
+            token=None, timeout=10, workers=200,
+        )
+        try:
+            if run_args.loop:
+                await run_loop(
+                    interval=run_args.interval,
+                    skip_fetch=run_args.skip_fetch,
+                    skip_repos=run_args.skip_repos,
+                    skip_check=run_args.skip_check,
+                    token=run_args.token,
+                    timeout=run_args.timeout,
+                    workers=run_args.workers,
+                )
+            else:
+                await run_pipeline(
+                    skip_fetch=run_args.skip_fetch,
+                    skip_repos=run_args.skip_repos,
+                    skip_check=run_args.skip_check,
+                    token=run_args.token,
+                    timeout=run_args.timeout,
+                    workers=run_args.workers,
+                )
+        except KeyboardInterrupt:
+            print("\n[*] Run stopped by user.")
+
+    elif args.command == "add":
         if args.list:
             add_from_list(args.list, args.type)
         else:
@@ -1407,9 +1618,6 @@ async def async_main() -> None:
 
     elif args.command == "stats":
         show_stats()
-
-    else:
-        parser.print_help()
 
 
 def main() -> None:
