@@ -402,7 +402,9 @@ setInterval(() => {
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
-_DB_PATH = proxy_db.DB_PATH
+# Mutable container so the entry-point can swap the DB path at runtime
+# without hitting "global declared after assignment" on Python 3.12+.
+_cfg: Dict[str, Path] = {"db_path": proxy_db.DB_PATH}
 
 
 @app.route("/")
@@ -412,7 +414,7 @@ def index() -> str:
 
 @app.route("/api/stats")
 def api_stats():
-    stats = proxy_db.get_stats_sync(path=_DB_PATH)
+    stats = proxy_db.get_stats_sync(path=_cfg["db_path"])
     return jsonify(stats)
 
 
@@ -422,14 +424,14 @@ def api_proxies():
     ptype  = request.args.get("type")   or None
     limit  = min(int(request.args.get("limit", 5000)), 10000)
     rows   = proxy_db.get_all_proxies_sync(
-        status=status, proxy_type=ptype, limit=limit, path=_DB_PATH
+        status=status, proxy_type=ptype, limit=limit, path=_cfg["db_path"]
     )
     return jsonify(rows)
 
 
 @app.route("/api/proxies/online.txt")
 def api_online_txt():
-    rows = proxy_db.get_all_proxies_sync(status="online", limit=10000, path=_DB_PATH)
+    rows = proxy_db.get_all_proxies_sync(status="online", limit=10000, path=_cfg["db_path"])
     lines = "\n".join(f"{r['ip']}:{r['port']}" for r in rows)
     return Response(
         lines,
