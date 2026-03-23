@@ -1,22 +1,34 @@
 # Proxy IP Checker
 
-A Python script that checks proxy lists, categorises each proxy as **online** or **fallen**, and manages the results in neatly organised files.
+A **zero-setup** async Python tool that mines, checks, and manages proxy lists — categorising each proxy as **online** or **fallen** across all six major proxy types.
+
+---
+
+## Quick start — no installation needed
+
+```bash
+python proxy_checker.py
+```
+
+That's it. Missing packages (`aiohttp`, `aiohttp-socks`) are detected and installed automatically with `python -m pip` before the tool starts. No manual `pip install` required.
 
 ---
 
 ## Features
 
+* **Zero-setup** – missing dependencies are auto-installed on first run using `python -m pip`.
 * **Four input sources**
-  * Option **a** – a local text file (one `IP:PORT` per line)
-  * Option **b** – a file containing URLs (plain raw URLs *or* `https://github.com/{owner}/{repo}` lines — the latter are auto-expanded via the GitHub API)
-  * Option **c** – the built-in database of 170+ public proxy-list URLs (`fetch` command)
-  * Option **d** – 50 GitHub repositories auto-discovered via the GitHub API (`repos` command): finds every `.txt` file, classifies it by type, and fetches raw content
-* **One checker URL per proxy** – a rotating pool of ~50 IP-echo services ensures no single service is hammered and rate-limit risk is minimised.
-* **Fully async** – all network I/O (URL fetching and proxy checking) runs with `asyncio` + `aiohttp` for maximum throughput (default 200 concurrent checks).
-* **General info per proxy** – when a proxy is confirmed online the tool automatically gathers:
-  * 🌍 Country, city, and ISP (via [ipwho.is](https://ipwho.is))
-  * 🔒 Anonymity level: **Elite** (no proxy headers leaked) or **Anonymous** (httpbin.org header inspection)
-  * ⏱ Response time in milliseconds
+  * A local text file (one `IP:PORT` per line) via `add --list`
+  * A file of URLs (plain raw URLs *or* `https://github.com/{owner}/{repo}` lines auto-expanded via the GitHub API) via `add --urls`
+  * The built-in database of 170+ public proxy-list URLs (`fetch` command)
+  * 50 GitHub repositories auto-discovered via the GitHub API (`repos` command)
+* **SNTBS queue** – drop `SNTBS-{type}.txt` files (e.g. `SNTBS-socks5.txt`) next to the script to feed proxies into the pending queue; unchecked IPs are automatically saved back to the SNTBS file if a run is interrupted.
+* **One checker URL per proxy** – a rotating pool of ~50 IP-echo services prevents rate-limiting.
+* **Fully async** – all network I/O runs with `asyncio` + `aiohttp` (default 200 concurrent workers).
+* **General info per proxy** – country, city, ISP (via [ipwho.is](https://ipwho.is)), anonymity level (Elite / Anonymous), and response time in ms.
+* **SQLite database** – results are also stored in `proxy_lists/proxies.db` for the web dashboard (requires `aiosqlite`).
+* **Web dashboard** – `web_server.py` serves a live dark-theme dashboard on `http://127.0.0.1:8080`; also auto-installs Flask if missing.
+* **Standalone HTML dashboard** – open `index.html` directly in any browser (no server needed to view the UI — it connects to the running `web_server.py`).
 * **Automatic deduplication** – across all three lists (offline / online / fallen).
 * **Every major proxy type** – HTTP, HTTPS, SOCKS4, SOCKS4a, SOCKS5, SOCKS5h.
 
@@ -32,6 +44,12 @@ proxy_lists/
   online_socks4a.txt    online_socks5.txt      online_socks5h.txt
   fallen_http.txt       fallen_https.txt       fallen_socks4.txt
   fallen_socks4a.txt    fallen_socks5.txt      fallen_socks5h.txt
+  proxies.db            ← SQLite database (auto-created)
+
+SNTBS-http.txt          ← optional: drop IPs here to queue them for checking
+SNTBS-socks5.txt        ← one file per proxy type you want to feed
+…
+index.html              ← standalone browser dashboard
 ```
 
 | File prefix | Content | Format |
@@ -39,105 +57,108 @@ proxy_lists/
 | `offline_*` | Unchecked / pending proxies | `IP:PORT` |
 | `online_*`  | Verified, working proxies   | `[TYPE]IP:PORT(Xms)[CC][Anon][ISP]` |
 | `fallen_*`  | Dead / unreachable proxies  | `IP:PORT` |
+| `SNTBS-*`   | Still-Need-To-Be-Scanned queue | `IP:PORT` |
 
 Example online entry: `[SOCKS5]1.2.3.4:1080(312ms)[DE][Elite][Hetzner Online GmbH]`
 
-The directory and files are created automatically on first run.
+All directories and files are created automatically on first run.
 
 ---
 
-## Installation
+## SNTBS files — persistent pending queue
 
-```bash
-pip install -r requirements.txt
+**SNTBS** (Still Need To Be Scanned) files let you feed proxies into the checker without touching the `proxy_lists/` directory manually.
+
+**Adding proxies:**
+
+Create a file named `SNTBS-{proxytype}.txt` (e.g. `SNTBS-socks5.txt`) in the same directory as `proxy_checker.py`, one `IP:PORT` per line:
+
+```
+1.2.3.4:1080
+5.6.7.8:9050
 ```
 
-> **SOCKS support** is included via `aiohttp-socks` which provides async SOCKS4/SOCKS4a/SOCKS5/SOCKS5h proxy connectors.
+On the next run, `proxy_checker.py` automatically imports the IPs into `offline_{type}.txt` and clears the SNTBS file.
+
+**Interrupted runs:**
+
+If a run is stopped (Ctrl+C or error) before all proxies are checked, any unchecked IPs are automatically written back to `SNTBS-{type}.txt` so they are not lost and will be picked up on the next run:
+
+```
+[~] Saved 4823 unchecked SOCKS5 proxies to SNTBS-socks5.txt
+```
 
 ---
 
 ## Usage
 
-### Auto-discover proxies from GitHub repos
-
-The `repos` command queries **50 configured GitHub repositories** via the GitHub API, automatically discovers every proxy-list `.txt` file in each repo, classifies each file by proxy type from its filename, and fetches the raw content — no manual URL maintenance needed.
+### Run the full pipeline (default)
 
 ```bash
-# Fetch from all 50 GitHub repos (all proxy types)
-python proxy_checker.py repos
-
-# Fetch only SOCKS5 files from GitHub repos
-python proxy_checker.py repos --type socks5
-
-# List all configured GitHub repo sources
-python proxy_checker.py repos --list-repos
-
-# Use a GitHub token for 5 000 req/hour (vs 60 req/hour unauthenticated)
-GITHUB_TOKEN=ghp_xxx python proxy_checker.py repos
-# or
-python proxy_checker.py repos --token ghp_xxx
+python proxy_checker.py
 ```
 
-When the `GITHUB_TOKEN` environment variable (or `--token`) is set, authenticated GitHub API calls are used which have a much higher rate limit. For 50 repos the unauthenticated limit (60/hour) is usually sufficient — the command makes 1–2 API calls per repo.
+Runs all steps in sequence: fetch from 170+ sources → discover GitHub repos → check all offline proxies → print statistics.
 
-**GitHub repo URL auto-expansion in `add --urls`**
-
-If your URLs file contains `https://github.com/{owner}/{repo}` lines alongside plain `https://raw.githubusercontent.com/…` URLs, the tool automatically expands the repo URLs to raw file URLs for the specified type:
-
-```
-# proxy_sources.txt
-https://github.com/TheSpeedX/PROXY-List
-https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt
-```
 ```bash
-python proxy_checker.py add --urls proxy_sources.txt --type socks5
+# Repeat every hour forever
+python proxy_checker.py run --loop
+
+# Custom interval
+python proxy_checker.py run --loop --interval 30m
+
+# Skip the GitHub repo step
+python proxy_checker.py run --skip-repos
 ```
 
+### Fetch from built-in sources
 
-
-Download from 170+ public proxy-list sources (GitHub repos + web APIs) in one command:
 ```bash
-# Fetch all types (http, https, socks4, socks4a, socks5, socks5h)
-python proxy_checker.py fetch
-
-# Fetch only SOCKS5 proxies
+python proxy_checker.py fetch           # all types
 python proxy_checker.py fetch --type socks5
 ```
 
-### Add proxies to an offline list
+### Auto-discover proxies from GitHub repos
+
+```bash
+python proxy_checker.py repos           # all 50 repos, all types
+python proxy_checker.py repos --type socks5
+python proxy_checker.py repos --list-repos   # print configured repos
+GITHUB_TOKEN=ghp_xxx python proxy_checker.py repos   # authenticated (5 000 req/h)
+```
+
+### Add proxies manually
 
 **From a local file** (one `IP:PORT` per line):
 ```bash
 python proxy_checker.py add --list my_proxies.txt --type http
-python proxy_checker.py add --list socks_proxies.txt --type socks5
 ```
 
-**From a URLs file** (one URL per line, each URL returns a proxy list):
+**From a URLs file** (one URL or `https://github.com/{owner}/{repo}` per line):
 ```bash
-python proxy_checker.py add --urls proxy_sources.txt --type https
+python proxy_checker.py add --urls proxy_sources.txt --type socks5
 ```
 
 ### Check proxies
 
 ```bash
-# Check all types
-python proxy_checker.py check
-
-# Check only SOCKS4a proxies
-python proxy_checker.py check --type socks4a
-
-# Custom timeout (15 s) and 100 concurrent workers
+python proxy_checker.py check                          # all types
+python proxy_checker.py check --type socks4a           # one type
 python proxy_checker.py check --type http --timeout 15 --workers 100
 ```
 
 When checking:
 1. Each proxy in `offline_{type}.txt` is tested against a unique checker URL.
-2. **Working** proxies are enriched with country, city, ISP, and anonymity level, appended to `online_{type}.txt`, and removed from `offline_{type}.txt`.
-3. **Dead** proxies are appended to `fallen_{type}.txt` and removed from `offline_{type}.txt`.
+2. **Working** proxies → enriched with geo + anonymity info → `online_{type}.txt`.
+3. **Dead** proxies → `fallen_{type}.txt`.
+4. `offline_{type}.txt` is bulk-cleared after all batches complete.
+5. Any proxies not reached (interrupted run) are saved to `SNTBS-{type}.txt`.
 
-Example console output for a working proxy:
+Example console output:
 ```
 [+] ONLINE  1.2.3.4:1080  312 ms  (SOCKS5)  [Elite]  DE, Frankfurt  Hetzner Online GmbH
+[-] FALLEN  9.8.7.6:3128
+[~] Saved 4823 unchecked SOCKS5 proxies to SNTBS-socks5.txt
 ```
 
 ### Show statistics
@@ -146,7 +167,6 @@ Example console output for a working proxy:
 python proxy_checker.py stats
 ```
 
-Example output:
 ```
 === Proxy List Statistics ===
 
@@ -159,6 +179,39 @@ Example output:
   SOCKS5          40        17        18
   SOCKS5H         38        14        15
 ```
+
+---
+
+## Web dashboard
+
+### Live server dashboard
+
+```bash
+python web_server.py                  # http://127.0.0.1:8080
+python web_server.py --port 9090
+python web_server.py --host 0.0.0.0  # expose on all interfaces
+```
+
+Flask is auto-installed if missing. The dashboard shows live stats, per-type breakdowns, a searchable proxy table with filtering, and a download link for `online_proxies.txt`.
+
+### Standalone HTML dashboard (`index.html`)
+
+Open `index.html` directly in any browser — no web server needed to *view* the UI. It connects to the running `web_server.py` (default `http://127.0.0.1:8080`) and auto-refreshes every 30 seconds.
+
+A connection banner at the top shows whether the server is reachable. You can change the server address in the input field and click **Connect** if you run the server on a different port or host.
+
+```
+⚡ Connected to http://127.0.0.1:8080
+```
+
+### API endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | HTML dashboard |
+| `GET /api/stats` | JSON statistics summary |
+| `GET /api/proxies` | JSON proxy list (`?status=online&type=socks5&limit=1000`) |
+| `GET /api/proxies/online.txt` | Plain-text `IP:PORT` download |
 
 ---
 
@@ -175,19 +228,20 @@ Example output:
 
 ---
 
-## Example: URLs source file
+## Optional: Tor hidden service
 
-`proxy_sources.txt`
+```bash
+python tor_service.py
 ```
-https://raw.githubusercontent.com/example/proxy-list/main/http.txt
-https://somesite.com/proxies/socks5.txt
-```
+
+Exposes the web dashboard as a Tor `.onion` address (requires Tor to be installed and `stem` — auto-installed on run).
 
 ---
 
 ## Notes
 
-* `ssl=False` is used intentionally when connecting through proxies to avoid certificate errors; this is expected behaviour for proxy testing.
+* `ssl=False` is used intentionally when connecting through proxies to avoid certificate errors — this is expected behaviour for proxy testing.
 * Proxies already present in `online_*` or `fallen_*` are never re-added to `offline_*`.
-* The checker URL pool is shuffled before each run so the assignment varies between sessions.
+* The checker URL pool is shuffled before each run so URL assignment varies between sessions.
 * Geo and anonymity lookups are rate-limited to 15 concurrent requests to respect free-tier limits of ipwho.is and httpbin.org.
+* Set `GITHUB_TOKEN` for the higher 5 000 req/hour GitHub API rate limit (default: 60 req/hour unauthenticated).
