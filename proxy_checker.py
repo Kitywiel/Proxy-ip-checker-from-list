@@ -2,11 +2,13 @@
 """
 Proxy IP Checker
 ================
-Checks proxies from a local list (option a) or from a file of URLs pointing
-to proxy lists (option b).
+Checks proxies from a local list (option a), from a file of URLs pointing
+to proxy lists (option b), or from the built-in URL database (option c).
 
-Each proxy is tested against a unique checker URL drawn from a rotating pool
-of ~50 IP-echo services, which spreads the load and avoids rate-limits.
+All network I/O runs fully asynchronously (asyncio + aiohttp) for maximum
+throughput.  Each proxy is tested against a unique checker URL drawn from a
+rotating pool of ~50 IP-echo services, which spreads the load and avoids
+rate-limits.
 
 Directory layout (auto-created):
   proxy_lists/
@@ -19,6 +21,7 @@ Supported types: http, https, socks4, socks5
 Usage examples:
   python proxy_checker.py add --list my_proxies.txt --type http
   python proxy_checker.py add --urls url_sources.txt --type socks5
+  python proxy_checker.py fetch --type all
   python proxy_checker.py check --type all
   python proxy_checker.py stats
 """
@@ -27,17 +30,13 @@ import re
 import sys
 import time
 import random
+import asyncio
 import argparse
-import threading
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
-import urllib3
-import requests
-
-# Suppress SSL warnings for proxy testing
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import aiohttp
+from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -46,8 +45,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 PROXY_LISTS_DIR = Path("proxy_lists")
 PROXY_TYPES = ["http", "https", "socks4", "socks5"]
 
-# ~50 IP-echo services used to test each proxy.
-# Each proxy is assigned exactly one URL from this list (round-robin).
+# ~50 IP-echo services used to verify each proxy.
+# Each proxy is assigned exactly one URL from this pool (round-robin).
 CHECKER_URLS: List[str] = [
     "https://api.ipify.org",
     "https://api.my-ip.io/ip",
@@ -101,28 +100,161 @@ CHECKER_URLS: List[str] = [
     "https://ip.guide",
 ]
 
+# Built-in proxy-list source URLs, organized by proxy type.
+# Used by the `fetch` command.
+PROXY_SOURCE_URLS: Dict[str, List[str]] = {
+    "http": [
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
+        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
+        "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/http.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+        "https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/free.txt",
+        "https://raw.githubusercontent.com/Volodichev/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/hanwayTech/free-proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/http.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+        "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/im-razvan/proxy_list/main/http.txt",
+        "https://raw.githubusercontent.com/mertguvencli/http-proxy-list/main/proxy-list/data.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+        "https://www.proxy-list.download/api/v1/get?type=http",
+        "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/http.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+        "https://raw.githubusercontent.com/hendrikbgr/Free-Proxy-Repo/master/proxy_list.txt",
+        "https://raw.githubusercontent.com/manuGMG/proxy-365/main/SOCKS5.txt",
+        "https://raw.githubusercontent.com/zinon/proxy-lists/master/lists/all-proxies.txt",
+        "https://raw.githubusercontent.com/Nocturnusx/Proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/yuceltoluyag/GoodProxy/main/raw.txt",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=http",
+    ],
+    "https": [
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt",
+        "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/https.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/https_proxies.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/https.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/https.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+        "https://www.proxy-list.download/api/v1/get?type=https",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=https",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=https",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=https&timeout=10000&country=all",
+    ],
+    "socks4": [
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks4.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS4.txt",
+        "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks4_proxies.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+        "https://raw.githubusercontent.com/hanwayTech/free-proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks4/socks4.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/socks4.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt",
+        "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
+        "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/socks4.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
+        "https://www.proxy-list.download/api/v1/get?type=socks4",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks4",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=socks4",
+    ],
+    "socks5": [
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks5.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS5.txt",
+        "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/Volodichev/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks5_proxies.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+        "https://raw.githubusercontent.com/hanwayTech/free-proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/socks5.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
+        "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/manuGMG/proxy-365/main/SOCKS5.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
+        "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/socks5.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+        "https://www.proxy-list.download/api/v1/get?type=socks5",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks5",
+        "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc&protocols=socks5",
+    ],
+}
+
 # ---------------------------------------------------------------------------
-# Thread-safe file helpers
+# Async-safe file helpers
 # ---------------------------------------------------------------------------
 
-_file_locks: Dict[str, threading.Lock] = {}
-_locks_lock = threading.Lock()
+_file_locks: Dict[str, asyncio.Lock] = {}
 
 
-def _get_lock(path: Path) -> threading.Lock:
+def _get_lock(path: Path) -> asyncio.Lock:
+    """Return (creating lazily) an asyncio.Lock for *path*.
+
+    Safe to call without any outer lock because asyncio is single-threaded:
+    no other coroutine can interleave between the dict lookup and the
+    assignment (there is no ``await`` in this function).
+    """
     key = str(path.resolve())
-    with _locks_lock:
-        if key not in _file_locks:
-            _file_locks[key] = threading.Lock()
-        return _file_locks[key]
+    if key not in _file_locks:
+        _file_locks[key] = asyncio.Lock()
+    return _file_locks[key]
 
 
 def read_proxies(path: Path) -> List[str]:
     """Return deduplicated, non-empty lines from *path* (preserves order)."""
     if not path.exists():
         return []
-    seen = set()
-    result = []
+    seen: set = set()
+    result: List[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if line and not line.startswith("#") and line not in seen:
@@ -133,7 +265,7 @@ def read_proxies(path: Path) -> List[str]:
 
 def write_proxies(path: Path, proxies: List[str]) -> None:
     """Write *proxies* to *path*, deduplicating while preserving order."""
-    seen = set()
+    seen: set = set()
     unique: List[str] = []
     for p in proxies:
         if p not in seen:
@@ -142,23 +274,23 @@ def write_proxies(path: Path, proxies: List[str]) -> None:
     path.write_text("\n".join(unique) + ("\n" if unique else ""), encoding="utf-8")
 
 
-def append_proxy(path: Path, entry: str) -> None:
-    """Thread-safely append *entry* to *path* if it is not already present."""
+async def append_proxy(path: Path, entry: str) -> None:
+    """Async-safely append *entry* to *path* if not already present."""
     lock = _get_lock(path)
-    with lock:
-        existing = read_proxies(path)
+    async with lock:
+        existing = await asyncio.to_thread(read_proxies, path)
         if entry not in existing:
             existing.append(entry)
-            write_proxies(path, existing)
+            await asyncio.to_thread(write_proxies, path, existing)
 
 
-def remove_proxy(path: Path, entry: str) -> None:
-    """Thread-safely remove *entry* from *path*."""
+async def remove_proxy(path: Path, entry: str) -> None:
+    """Async-safely remove *entry* from *path*."""
     lock = _get_lock(path)
-    with lock:
-        existing = read_proxies(path)
+    async with lock:
+        existing = await asyncio.to_thread(read_proxies, path)
         updated = [p for p in existing if p != entry]
-        write_proxies(path, updated)
+        await asyncio.to_thread(write_proxies, path, updated)
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +343,10 @@ def parse_proxy(entry: str) -> Optional[Tuple[str, int]]:
 
 
 # ---------------------------------------------------------------------------
-# Proxy testing
+# Async proxy testing
 # ---------------------------------------------------------------------------
 
-def check_proxy(
+async def check_proxy(
     ip: str,
     port: int,
     proxy_type: str,
@@ -222,54 +354,121 @@ def check_proxy(
     timeout: int = 10,
 ) -> Tuple[bool, float]:
     """
-    Attempt to reach *checker_url* through the proxy at ip:port.
+    Asynchronously attempt to reach *checker_url* through the proxy at ip:port.
     Returns (success, response_time_ms).
     """
-    scheme = proxy_type if proxy_type in ("http", "https") else proxy_type
-    proxy_url = f"{scheme}://{ip}:{port}"
-    proxies = {"http": proxy_url, "https": proxy_url}
-
+    proxy_url = f"{proxy_type}://{ip}:{port}"
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
     start = time.monotonic()
     try:
-        resp = requests.get(
-            checker_url,
-            proxies=proxies,
-            timeout=timeout,
-            verify=False,
-            allow_redirects=True,
-        )
-        elapsed_ms = (time.monotonic() - start) * 1000.0
-        if 200 <= resp.status_code < 300:
-            return True, round(elapsed_ms, 2)
+        if proxy_type in ("socks4", "socks5"):
+            connector = ProxyConnector.from_url(proxy_url, ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(
+                    checker_url,
+                    timeout=client_timeout,
+                    ssl=False,
+                    allow_redirects=True,
+                ) as resp:
+                    elapsed_ms = (time.monotonic() - start) * 1000.0
+                    if 200 <= resp.status < 300:
+                        return True, round(elapsed_ms, 2)
+        else:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(
+                    checker_url,
+                    proxy=proxy_url,
+                    timeout=client_timeout,
+                    ssl=False,
+                    allow_redirects=True,
+                ) as resp:
+                    elapsed_ms = (time.monotonic() - start) * 1000.0
+                    if 200 <= resp.status < 300:
+                        return True, round(elapsed_ms, 2)
     except Exception:
         pass
     return False, 0.0
 
 
-def _worker(
+async def _check_worker(
     raw: str,
     proxy_type: str,
     checker_url: str,
     timeout: int,
-) -> Tuple[str, bool, float]:
-    """Worker function run in a thread pool."""
-    parsed = parse_proxy(raw)
-    if parsed is None:
-        return raw, False, 0.0
-    ip, port = parsed
-    success, ms = check_proxy(ip, port, proxy_type, checker_url, timeout)
-    return raw, success, ms
+    semaphore: asyncio.Semaphore,
+    offline: Path,
+    online: Path,
+    fallen: Path,
+    counters: Dict[str, int],
+) -> None:
+    """Async worker: test one proxy and update the three list files."""
+    async with semaphore:
+        parsed = parse_proxy(raw)
+        if parsed is None:
+            await remove_proxy(offline, raw)
+            return
+
+        ip, port = parsed
+        bare = f"{ip}:{port}"
+        success, ms = await check_proxy(ip, port, proxy_type, checker_url, timeout)
+
+        await remove_proxy(offline, raw)
+
+        if success:
+            entry = f"[{proxy_type.upper()}]{ip}:{port}({ms}ms)"
+            await append_proxy(online, entry)
+            print(f"[+] ONLINE  {ip}:{port}  {ms:.0f} ms  ({proxy_type.upper()})")
+            counters["online"] += 1
+        else:
+            await append_proxy(fallen, bare)
+            print(f"[-] FALLEN  {ip}:{port}")
+            counters["fallen"] += 1
+
+        counters["checked"] += 1
 
 
 # ---------------------------------------------------------------------------
-# High-level operations
+# Async URL fetching
 # ---------------------------------------------------------------------------
 
-def check_proxies(proxy_type: str, timeout: int = 10, max_workers: int = 50) -> None:
+async def _fetch_url(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> List[str]:
+    """Download a proxy list from *url* and return non-empty lines."""
+    try:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=15),
+            ssl=False,
+        ) as resp:
+            resp.raise_for_status()
+            text = await resp.text(errors="replace")
+            return [
+                ln.strip()
+                for ln in text.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+    except Exception as exc:
+        print(f"[!] Failed to fetch {url}: {exc}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# High-level async operations
+# ---------------------------------------------------------------------------
+
+async def check_proxies(
+    proxy_type: str,
+    timeout: int = 10,
+    max_workers: int = 200,
+) -> None:
     """
-    Read all proxies from offline_{proxy_type}.txt, test each one, then:
-      - working  → online_{proxy_type}.txt  as [TYPE]IP:PORT(Xms)
-      - dead     → fallen_{proxy_type}.txt  as IP:PORT
+    Read all proxies from offline_{proxy_type}.txt, test each one
+    asynchronously, then:
+      - working → online_{proxy_type}.txt  as [TYPE]IP:PORT(Xms)
+      - dead    → fallen_{proxy_type}.txt  as IP:PORT
     Tested proxies are removed from the offline list.
     """
     offline = PROXY_LISTS_DIR / f"offline_{proxy_type}.txt"
@@ -286,48 +485,30 @@ def check_proxies(proxy_type: str, timeout: int = 10, max_workers: int = 50) -> 
     # Assign each proxy a unique checker URL (round-robin over a shuffled pool)
     pool = CHECKER_URLS.copy()
     random.shuffle(pool)
+
+    semaphore = asyncio.Semaphore(max_workers)
+    counters: Dict[str, int] = {"checked": 0, "online": 0, "fallen": 0}
+
     tasks = [
-        (raw, proxy_type, pool[i % len(pool)], timeout)
+        _check_worker(
+            raw=raw,
+            proxy_type=proxy_type,
+            checker_url=pool[i % len(pool)],
+            timeout=timeout,
+            semaphore=semaphore,
+            offline=offline,
+            online=online,
+            fallen=fallen,
+            counters=counters,
+        )
         for i, raw in enumerate(proxies)
     ]
 
-    checked = online_count = fallen_count = 0
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_worker, *t): t[0] for t in tasks}
-        for future in as_completed(futures):
-            raw = futures[future]
-            try:
-                raw_result, success, ms = future.result()
-            except Exception as exc:
-                print(f"[!] Unexpected error for {raw}: {exc}")
-                continue
-
-            parsed = parse_proxy(raw_result)
-            if parsed is None:
-                remove_proxy(offline, raw_result)
-                continue
-
-            ip, port = parsed
-            bare = f"{ip}:{port}"
-
-            remove_proxy(offline, raw_result)
-
-            if success:
-                entry = f"[{proxy_type.upper()}]{ip}:{port}({ms}ms)"
-                append_proxy(online, entry)
-                print(f"[+] ONLINE  {ip}:{port}  {ms:.0f} ms  ({proxy_type.upper()})")
-                online_count += 1
-            else:
-                append_proxy(fallen, bare)
-                print(f"[-] FALLEN  {ip}:{port}")
-                fallen_count += 1
-
-            checked += 1
+    await asyncio.gather(*tasks)
 
     print(
-        f"\n[*] {proxy_type.upper()} — checked {checked}: "
-        f"{online_count} online, {fallen_count} fallen.\n"
+        f"\n[*] {proxy_type.upper()} — checked {counters['checked']}: "
+        f"{counters['online']} online, {counters['fallen']} fallen.\n"
     )
 
 
@@ -366,32 +547,47 @@ def add_from_list(source_file: str, proxy_type: str) -> None:
     print(f"[*] Added {added} new {proxy_type.upper()} proxies to {offline}")
 
 
-def _fetch_url(url: str) -> List[str]:
-    """Download a proxy list from *url* and return non-empty lines."""
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        return [ln.strip() for ln in resp.text.splitlines() if ln.strip() and not ln.startswith("#")]
-    except Exception as exc:
-        print(f"[!] Failed to fetch {url}: {exc}")
-        return []
-
-
-def add_from_urls(urls_file: str, proxy_type: str) -> None:
+async def add_from_urls(urls_file: str, proxy_type: str) -> None:
     """
-    Download proxy lists from each URL in *urls_file* and import them into
-    offline_{proxy_type}.txt, ignoring duplicates.
+    Download proxy lists from each URL in *urls_file* concurrently and import
+    them into offline_{proxy_type}.txt, ignoring duplicates.
     """
     uf = Path(urls_file)
     if not uf.exists():
         sys.exit(f"[!] URLs file not found: {urls_file}")
 
-    urls = [ln.strip() for ln in uf.read_text(encoding="utf-8").splitlines()
-            if ln.strip() and not ln.startswith("#")]
+    urls = [
+        ln.strip()
+        for ln in uf.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.startswith("#")
+    ]
     if not urls:
         print("[!] No URLs found in the file.")
         return
 
+    await _import_from_url_list(urls, proxy_type)
+
+
+async def fetch_builtin(proxy_type: str) -> None:
+    """
+    Download proxy lists from the built-in PROXY_SOURCE_URLS for *proxy_type*
+    concurrently and import them into offline_{proxy_type}.txt.
+    """
+    types = PROXY_TYPES if proxy_type == "all" else [proxy_type]
+    for ptype in types:
+        urls = PROXY_SOURCE_URLS.get(ptype, [])
+        if not urls:
+            print(f"[!] No built-in sources for type: {ptype}")
+            continue
+        print(f"\n[*] Fetching {len(urls)} built-in sources for {ptype.upper()} …")
+        await _import_from_url_list(urls, ptype)
+
+
+async def _import_from_url_list(urls: List[str], proxy_type: str) -> None:
+    """
+    Fetch all *urls* concurrently, parse proxy entries, and append new ones
+    to offline_{proxy_type}.txt (deduplicating against all three lists).
+    """
     offline = PROXY_LISTS_DIR / f"offline_{proxy_type}.txt"
     online = PROXY_LISTS_DIR / f"online_{proxy_type}.txt"
     fallen = PROXY_LISTS_DIR / f"fallen_{proxy_type}.txt"
@@ -400,10 +596,18 @@ def add_from_urls(urls_file: str, proxy_type: str) -> None:
     already_online = {strip_decorations(e) for e in read_proxies(online)}
     already_fallen = set(read_proxies(fallen))
 
+    connector = aiohttp.TCPConnector(ssl=False, limit=20)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        results = await asyncio.gather(
+            *[_fetch_url(session, url) for url in urls],
+            return_exceptions=True,
+        )
+
     total_added = 0
-    for url in urls:
-        print(f"[*] Fetching: {url}")
-        lines = _fetch_url(url)
+    for url, lines in zip(urls, results):
+        if isinstance(lines, Exception):
+            print(f"[!] Error fetching {url}: {lines}")
+            continue
         added = 0
         for line in lines:
             parsed = parse_proxy(line)
@@ -415,7 +619,8 @@ def add_from_urls(urls_file: str, proxy_type: str) -> None:
                 continue
             existing_offline.add(bare)
             added += 1
-        print(f"    → {added} new proxies")
+        if added:
+            print(f"    {url}  → {added} new")
         total_added += added
 
     write_proxies(offline, sorted(existing_offline))
@@ -447,7 +652,7 @@ def show_stats() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="proxy_checker",
-        description="Proxy IP checker — add, check and manage proxy lists.",
+        description="Proxy IP checker — add, fetch, check and manage proxy lists.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -474,6 +679,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Proxy type: http | https | socks4 | socks5",
     )
 
+    # -- fetch --
+    fetch_p = sub.add_parser(
+        "fetch",
+        help="Download proxies from the built-in source URL list",
+    )
+    fetch_p.add_argument(
+        "--type", "-t",
+        choices=PROXY_TYPES + ["all"],
+        default="all",
+        metavar="TYPE",
+        help="Which type(s) to fetch (default: all)",
+    )
+
     # -- check --
     chk_p = sub.add_parser("check", help="Test proxies from the offline lists")
     chk_p.add_argument(
@@ -493,9 +711,9 @@ def build_parser() -> argparse.ArgumentParser:
     chk_p.add_argument(
         "--workers", "-w",
         type=int,
-        default=50,
+        default=200,
         metavar="N",
-        help="Concurrent worker threads (default: 50)",
+        help="Max concurrent async checks (default: 200)",
     )
 
     # -- stats --
@@ -504,7 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+async def async_main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
@@ -514,18 +732,25 @@ def main() -> None:
         if args.list:
             add_from_list(args.list, args.type)
         else:
-            add_from_urls(args.urls, args.type)
+            await add_from_urls(args.urls, args.type)
+
+    elif args.command == "fetch":
+        await fetch_builtin(args.type)
 
     elif args.command == "check":
         types = PROXY_TYPES if args.type == "all" else [args.type]
         for ptype in types:
-            check_proxies(ptype, timeout=args.timeout, max_workers=args.workers)
+            await check_proxies(ptype, timeout=args.timeout, max_workers=args.workers)
 
     elif args.command == "stats":
         show_stats()
 
     else:
         parser.print_help()
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

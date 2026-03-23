@@ -6,11 +6,12 @@ A Python script that checks proxy lists, categorises each proxy as **online** or
 
 ## Features
 
-* **Two input sources**
+* **Three input sources**
   * Option **a** – a local text file (one `IP:PORT` per line)
   * Option **b** – a file containing URLs that serve proxy lists
+  * Option **c** – the built-in database of 100+ public proxy-list URLs (`fetch` command)
 * **One checker URL per proxy** – a rotating pool of ~50 IP-echo services ensures no single service is hammered and rate-limit risk is minimised.
-* **Concurrent checking** – configurable thread-pool (default 50 workers).
+* **Fully async** – all network I/O (URL fetching and proxy checking) runs with `asyncio` + `aiohttp` for maximum throughput (default 200 concurrent checks).
 * **Automatic deduplication** – across all three lists (offline / online / fallen).
 * Supports **HTTP, HTTPS, SOCKS4, SOCKS5** proxy types.
 
@@ -41,11 +42,22 @@ The directory and files are created automatically on first run.
 pip install -r requirements.txt
 ```
 
-> **SOCKS support** is included via `requests[socks]` which bundles PySocks.
+> **SOCKS support** is included via `aiohttp-socks` which provides async SOCKS4/SOCKS5 proxy connectors.
 
 ---
 
 ## Usage
+
+### Fetch proxies from the built-in source list
+
+Download from 100+ public proxy-list URLs in one command:
+```bash
+# Fetch all types (http, https, socks4, socks5)
+python proxy_checker.py fetch
+
+# Fetch only SOCKS5 proxies
+python proxy_checker.py fetch --type socks5
+```
 
 ### Add proxies to an offline list
 
@@ -110,6 +122,6 @@ https://somesite.com/proxies/socks5.txt
 
 ## Notes
 
-* `verify=False` is used intentionally when connecting through proxies; SSL warnings are suppressed.
+* `ssl=False` is used intentionally when connecting through proxies to avoid certificate errors; this is expected behaviour for proxy testing.
 * Proxies already present in `online_*` or `fallen_*` are never re-added to `offline_*`.
 * The checker URL pool is shuffled before each run so the assignment varies between sessions.
