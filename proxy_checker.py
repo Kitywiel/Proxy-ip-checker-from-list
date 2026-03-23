@@ -56,7 +56,9 @@ import time
 import json
 import random
 import asyncio
+import logging
 import argparse
+import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -71,65 +73,173 @@ except ImportError:
     _DB_ENABLED = False
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Global error handler
+#
+# Catches every unhandled exception — both synchronous (sys.excepthook) and
+# asyncio task exceptions — logs them to proxy_checker_errors.log WITH a
+# full traceback and timestamp, and prints a short summary to stderr.
+# The process is NEVER terminated by an unhandled exception; run_loop
+# wraps pipeline iterations so errors cause a retry, not a crash.
 # ---------------------------------------------------------------------------
+
+_ERROR_LOG = Path("proxy_checker_errors.log")
+
+logging.basicConfig(
+    filename=str(_ERROR_LOG),
+    level=logging.ERROR,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_log = logging.getLogger("proxy_checker")
+
+
+def _fmt_exc(exc_type, exc_value, exc_tb) -> str:
+    return "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+
+
+def _global_excepthook(exc_type, exc_value, exc_tb) -> None:
+    """sys.excepthook — catches any unhandled top-level exception."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    msg = _fmt_exc(exc_type, exc_value, exc_tb)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[!] [{ts}] UNHANDLED EXCEPTION:\n{msg}", file=sys.stderr, flush=True)
+    _log.error("Unhandled exception:\n%s", msg)
+
+
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """asyncio event-loop exception handler — catches unhandled task errors."""
+    exc = context.get("exception")
+    desc = context.get("message", "Unknown asyncio error")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    if exc is not None:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        full = f"{desc}\n{tb}"
+    else:
+        full = desc
+    print(f"\n[!] [{ts}] ASYNCIO ERROR: {full}", file=sys.stderr, flush=True)
+    _log.error("Asyncio error: %s", full)
+
+
+def _install_error_handlers() -> None:
+    """Install both error hooks.  Call once at program start."""
+    sys.excepthook = _global_excepthook
+    try:
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(_asyncio_exception_handler)
+    except RuntimeError:
+        pass  # no running loop yet — asyncio handler set in async_main instead
 
 PROXY_LISTS_DIR = Path("proxy_lists")
 PROXY_TYPES = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"]
 
-# ~50 IP-echo services used to verify each proxy.
+# ~100 IP-echo services used to verify each proxy.
 # Each proxy is assigned exactly one URL from this pool (round-robin).
+# Grouped: plain-text IP, JSON IP, HTTP fallbacks.
 CHECKER_URLS: List[str] = [
+    # ── Plain-text IP response (fastest — no JSON parsing needed) ────────────
     "https://api.ipify.org",
-    "https://api.my-ip.io/ip",
-    "https://checkip.amazonaws.com",
-    "https://ipinfo.io/ip",
+    "https://api4.ipify.org",
+    "https://ipv4.icanhazip.com",
     "https://icanhazip.com",
     "https://ident.me",
+    "https://4.ident.me",
     "https://ipecho.net/plain",
+    "https://checkip.amazonaws.com",
     "https://myexternalip.com/raw",
     "https://wtfismyip.com/text",
     "https://ip.seeip.org",
     "https://ip4.seeip.org",
-    "https://ip.42.pl/raw",
-    "https://www.trackip.net/ip",
-    "https://ipv4.icanhazip.com",
-    "https://httpbin.org/ip",
+    "https://ipv4.seeip.org",
     "https://ifconfig.me/ip",
     "https://ifconfig.co/ip",
-    "https://myip.wtf/text",
+    "https://ifconfig.io/ip",
+    "https://ifconfig.es",
     "https://ip.tyk.nu",
     "https://l2.io/ip",
     "https://echoip.de",
-    "https://api.ip.sb/ip",
-    "https://ipv4bot.whatismyipaddress.com",
-    "https://bot.whatismyip.com/ip",
-    "https://4.ident.me",
-    "https://api4.my-ip.io/ip",
-    "https://ipv4.seeip.org",
-    "https://ipaddr.site",
-    "https://jsonip.com",
-    "https://ip-api.io/json",
-    "https://ipapi.co/ip",
-    "https://ipwho.is",
-    "https://ip.nf/me.txt",
-    "http://ip-api.com/json",
-    "http://checkip.amazonaws.com",
-    "http://ident.me",
-    "http://ipv4.icanhazip.com",
-    "https://api.bigdatacloud.net/data/client-ip",
-    "https://api.iplocation.net/?cmd=get-ip",
-    "https://freeipapi.com/api/json",
-    "https://ipinfo.io/json",
+    "https://myip.wtf/text",
+    "https://ip.42.pl/raw",
     "https://myip.dnsomatic.com",
     "https://ip.rootnet.in",
     "https://ip.ryans.org",
+    "https://ipaddr.site",
+    "https://ip.nf/me.txt",
+    "https://www.trackip.net/ip",
+    "https://api.my-ip.io/ip",
+    "https://api4.my-ip.io/ip",
     "https://checkip4.optimizely.com",
-    "https://www.cloudflare.com/cdn-cgi/trace",
-    "https://api.ipquery.io/",
+    "https://ip.oxylabs.io",
+    "https://ipv4.clarketm.com",
+    "https://ip.websupport.sk/",
+    "https://curlmyip.net",
+    "https://wgetip.com",
+    "https://eth0.me",
+    "https://ipof.in/txt",
+    "https://ip.neustar.biz",
+    "https://myip.com.au/ip.txt",
+    "https://ip.seeip.org/",
+    # ── JSON IP response ─────────────────────────────────────────────────────
+    "https://ipinfo.io/ip",
+    "https://ipinfo.io/json",
+    "https://httpbin.org/ip",
+    "https://jsonip.com",
+    "https://ip-api.io/json",
+    "https://ipapi.co/ip",
+    "https://ipapi.co/json",
+    "https://ipwho.is",
+    "https://api.ip.sb/ip",
+    "https://api.ip.sb/geoip",
+    "https://ipv4bot.whatismyipaddress.com",
+    "https://bot.whatismyip.com/ip",
+    "https://api.bigdatacloud.net/data/client-ip",
+    "https://api.iplocation.net/?cmd=get-ip",
+    "https://freeipapi.com/api/json",
     "https://ipgeolocation.io/",
     "https://ipapi.is/json",
     "https://ip.guide",
+    "https://api.ipquery.io/",
+    "https://api.ipdata.co?api-key=test",
+    "https://ip-api.com/json",
+    "https://ipwhois.app/json/",
+    "https://ipstack.com/",
+    "https://freegeoip.app/json/",
+    "https://geoipify.whoisxmlapi.com/api/v1",
+    "https://ipregistry.co/?key=tryout",
+    "https://extreme-ip-lookup.com/json/",
+    "https://www.geoplugin.net/json.gp",
+    "https://get.geojs.io/v1/ip",
+    "https://get.geojs.io/v1/ip/geo.json",
+    "https://api.db-ip.com/v2/free/self",
+    "https://geolocation-db.com/json/",
+    "https://api.hostip.info/get_json.php",
+    "https://iplist.cc/api",
+    "https://api.techniknews.net/ipgeo/",
+    "https://ipdetective.io/json",
+    "https://iplogger.org/api/geolocation",
+    "https://ip-api.com/json/?fields=query",
+    # ── Cloudflare / CDN traces ───────────────────────────────────────────────
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://1.1.1.1/cdn-cgi/trace",
+    "https://speed.cloudflare.com/meta",
+    # ── HTTP (non-TLS) fallbacks — useful for checking plain HTTP proxies ─────
+    "http://checkip.amazonaws.com",
+    "http://ident.me",
+    "http://ipv4.icanhazip.com",
+    "http://ip-api.com/json",
+    "http://ifconfig.me/ip",
+    "http://ifconfig.co/ip",
+    "http://myexternalip.com/raw",
+    "http://api.ipify.org",
+    "http://wtfismyip.com/text",
+    "http://ipecho.net/plain",
+    "http://curlmyip.net",
+    "http://wgetip.com",
+    "http://eth0.me",
+    "http://ip.seeip.org",
+    "http://myip.dnsomatic.com",
+    "http://ipapi.co/ip",
 ]
 
 # Built-in proxy-list source URLs, organized by proxy type.
@@ -591,8 +701,8 @@ async def fetch_github_repos(
 #   • Reads are served from RAM (_mem_cache) after the first disk load.
 #   • Writes update only _mem_cache and mark the path dirty — zero disk I/O.
 #   • A background task (_buffer_flusher_task) persists dirty files to disk
-#     every BUFFER_FLUSH_INTERVAL seconds, or immediately when the total
-#     buffered content exceeds BUFFER_FLUSH_SIZE_KB kilobytes.
+#     every BUFFER_FLUSH_INTERVAL seconds, or when BUFFER_FLUSH_EVERY_N
+#     proxies have been scanned since the last flush — whichever comes first.
 #   • flush_write_buffer() can also be called explicitly (e.g. after a full
 #     check cycle or on graceful shutdown).
 #
@@ -601,10 +711,13 @@ async def fetch_github_repos(
 # read-modify-write is inherently atomic — no per-file locking is needed.
 # ---------------------------------------------------------------------------
 
-#: Seconds between automatic flush-to-disk cycles.
+#: Seconds between automatic flush-to-disk cycles (safety net).
 BUFFER_FLUSH_INTERVAL: int = 60
-#: Flush immediately when the RAM buffer exceeds this many megabytes.
-BUFFER_FLUSH_SIZE_KB: int = 10
+#: Also flush after this many proxies have been scanned since the last flush.
+BUFFER_FLUSH_EVERY_N: int = 1000
+#: Number of proxies processed per asyncio.gather batch.
+#: Keeps Task object memory bounded (~30 MB per batch vs ~2 GB for 800k at once).
+SCAN_BATCH_SIZE: int = 10_000
 
 # resolved-path-string → ordered, deduplicated list of entries (live state)
 _mem_cache: Dict[str, List[str]] = {}
@@ -613,6 +726,7 @@ _mem_dirty: set = set()
 
 _last_flush_time: float = 0.0          # monotonic timestamp of last flush
 _flusher_handle: Optional[asyncio.Task] = None  # background task reference
+_checked_since_flush: int = 0          # proxies scanned since last flush
 
 
 def _cache_key(path: Path) -> str:
@@ -846,12 +960,20 @@ async def check_proxy(
     proxy_type: str,
     checker_url: str,
     timeout: int = 10,
+    http_session: Optional[aiohttp.ClientSession] = None,
 ) -> Tuple[bool, float]:
     """
     Asynchronously attempt to reach *checker_url* through the proxy at ip:port.
     Returns (success, response_time_ms).
 
     Supported proxy types: http, https, socks4, socks4a, socks5, socks5h.
+
+    *http_session* — a pre-created shared ClientSession for HTTP/HTTPS proxy
+    types.  Reusing one session across all workers eliminates per-check TCP
+    setup overhead while keeping full detection accuracy (each request still
+    goes through a different proxy via the ``proxy=`` parameter).
+    SOCKS proxies require a per-request ProxyConnector and always create their
+    own short-lived session.
     """
     proxy_url = f"{proxy_type}://{ip}:{port}"
     client_timeout = aiohttp.ClientTimeout(total=timeout)
@@ -870,9 +992,10 @@ async def check_proxy(
                     if 200 <= resp.status < 300:
                         return True, round(elapsed_ms, 2)
         else:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(
+            # HTTP / HTTPS — use the shared session when available so we
+            # don't create+destroy a TCPConnector for every single proxy.
+            if http_session is not None:
+                async with http_session.get(
                     checker_url,
                     proxy=proxy_url,
                     timeout=client_timeout,
@@ -882,6 +1005,19 @@ async def check_proxy(
                     elapsed_ms = (time.monotonic() - start) * 1000.0
                     if 200 <= resp.status < 300:
                         return True, round(elapsed_ms, 2)
+            else:
+                connector = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(
+                        checker_url,
+                        proxy=proxy_url,
+                        timeout=client_timeout,
+                        ssl=False,
+                        allow_redirects=True,
+                    ) as resp:
+                        elapsed_ms = (time.monotonic() - start) * 1000.0
+                        if 200 <= resp.status < 300:
+                            return True, round(elapsed_ms, 2)
     except Exception:
         pass
     return False, 0.0
@@ -907,26 +1043,29 @@ _GEO_SEMAPHORE: Optional[asyncio.Semaphore] = None
 def _get_geo_semaphore() -> asyncio.Semaphore:
     global _GEO_SEMAPHORE
     if _GEO_SEMAPHORE is None:
-        _GEO_SEMAPHORE = asyncio.Semaphore(15)
+        _GEO_SEMAPHORE = asyncio.Semaphore(50)
     return _GEO_SEMAPHORE
 
 
-async def _geo_lookup(ip: str) -> Dict[str, str]:
+async def _geo_lookup(
+    ip: str,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Dict[str, str]:
     """
     Retrieve geographic and network information for *ip* using ipwho.is.
     Returns a dict with keys: ``country_code``, ``country``, ``city``, ``isp``.
     Falls back to empty strings on any error.
+
+    Pass a shared *session* (created once in check_proxies) to avoid
+    creating and tearing down a new TCP connection for every lookup.
     """
     result = {"country_code": "", "country": "", "city": "", "isp": ""}
+    geo_timeout = aiohttp.ClientTimeout(total=8)
     async with _get_geo_semaphore():
         try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(
-                    f"https://ipwho.is/{ip}",
-                    timeout=aiohttp.ClientTimeout(total=8),
-                    ssl=False,
-                ) as resp:
+            url = f"https://ipwho.is/{ip}"
+            if session is not None:
+                async with session.get(url, timeout=geo_timeout, ssl=False) as resp:
                     if resp.status == 200:
                         data = await resp.json(content_type=None)
                         result["country_code"] = data.get("country_code") or ""
@@ -934,9 +1073,21 @@ async def _geo_lookup(ip: str) -> Dict[str, str]:
                         result["city"] = data.get("city") or ""
                         result["isp"] = (
                             data.get("connection", {}).get("isp")
-                            or data.get("org")
-                            or ""
+                            or data.get("org") or ""
                         )
+            else:
+                connector = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as s:
+                    async with s.get(url, timeout=geo_timeout, ssl=False) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            result["country_code"] = data.get("country_code") or ""
+                            result["country"] = data.get("country") or ""
+                            result["city"] = data.get("city") or ""
+                            result["isp"] = (
+                                data.get("connection", {}).get("isp")
+                                or data.get("org") or ""
+                            )
         except Exception:
             pass
     return result
@@ -959,6 +1110,7 @@ async def _anonymity_check(
       ``"Unknown"``   – could not reach the check endpoint
     """
     proxy_url = f"{proxy_type}://{ip}:{port}"
+    client_timeout = aiohttp.ClientTimeout(total=timeout)   # fix: was NameError
     async with _get_geo_semaphore():
         try:
             if proxy_type in ("socks4", "socks4a", "socks5", "socks5h"):
@@ -972,7 +1124,8 @@ async def _anonymity_check(
                 connector = aiohttp.TCPConnector(ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as session:
                     async with session.get(
-                        _ANONYMITY_CHECK_URL, proxy=proxy_url, timeout=client_timeout, ssl=False
+                        _ANONYMITY_CHECK_URL, proxy=proxy_url,
+                        timeout=client_timeout, ssl=False
                     ) as resp:
                         data = await resp.json(content_type=None)
 
