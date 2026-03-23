@@ -253,13 +253,14 @@ def get_stats_sync(path: Path = DB_PATH) -> Dict[str, Any]:
     Return aggregate statistics.
 
     Returns a dict with keys:
-      total, online, fallen,
-      by_type: {type: {total, online, fallen}}
+      total, online, fallen, success_rate,
+      by_type: {type: {total, online, fallen, success_rate}}
     """
     import sqlite3
 
     empty: Dict[str, Any] = {
-        "total": 0, "online": 0, "fallen": 0, "by_type": {},
+        "total": 0, "online": 0, "fallen": 0, "success_rate": 0.0,
+        "by_type": {},
     }
     if not path.exists():
         return empty
@@ -277,23 +278,32 @@ def get_stats_sync(path: Path = DB_PATH) -> Dict[str, Any]:
     finally:
         con.close()
 
-    by_type: Dict[str, Dict[str, int]] = {}
+    by_type: Dict[str, Dict[str, Any]] = {}
     total_online = 0
     total_fallen = 0
 
     for ptype, status, cnt in rows:
         if ptype not in by_type:
-            by_type[ptype] = {"total": 0, "online": 0, "fallen": 0}
+            by_type[ptype] = {"total": 0, "online": 0, "fallen": 0, "success_rate": 0.0}
         by_type[ptype]["total"] += cnt
-        by_type[ptype][status] = cnt
+        by_type[ptype][status]   = cnt
         if status == "online":
             total_online += cnt
         else:
             total_fallen += cnt
 
+    # Compute per-type success rate
+    for ptype, d in by_type.items():
+        t = d["total"]
+        d["success_rate"] = round(d["online"] / t * 100, 1) if t > 0 else 0.0
+
+    total = total_online + total_fallen
+    success_rate = round(total_online / total * 100, 1) if total > 0 else 0.0
+
     return {
-        "total": total_online + total_fallen,
-        "online": total_online,
-        "fallen": total_fallen,
-        "by_type": by_type,
+        "total":        total,
+        "online":       total_online,
+        "fallen":       total_fallen,
+        "success_rate": success_rate,
+        "by_type":      by_type,
     }

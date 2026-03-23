@@ -20,9 +20,10 @@ Routes:
 """
 
 import argparse
-import json
+import os
 import sys
 from pathlib import Path
+from typing import Dict
 
 try:
     from flask import Flask, jsonify, render_template_string, request, Response
@@ -71,19 +72,22 @@ _HTML = """<!DOCTYPE html>
 
   /* ── Layout ── */
   main{max-width:1500px;margin:0 auto;padding:20px 24px;}
-  section-title{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;
-    letter-spacing:.08em;font-weight:600;margin-bottom:10px;}
 
-  /* ── Global stat cards ── */
-  .stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:22px;}
+  /* ── Stat cards ── */
+  .stat-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+    gap:12px;margin-bottom:22px;}
   .stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
     padding:16px 20px;display:flex;flex-direction:column;gap:4px;}
   .stat-card .lbl{font-size:11px;color:var(--muted);text-transform:uppercase;
     letter-spacing:.06em;font-weight:600;}
-  .stat-card .val{font-size:2rem;font-weight:800;line-height:1;}
+  .stat-card .val{font-size:1.9rem;font-weight:800;line-height:1.1;}
+  .stat-card .sub{font-size:11px;color:var(--muted);margin-top:2px;}
   .val.blue{color:var(--blue);}
   .val.green{color:var(--green);}
   .val.red{color:var(--red);}
+  .val.yellow{color:var(--yellow);}
+  .val.purple{color:var(--purple);}
+  .val.orange{color:var(--orange);}
 
   /* ── Per-type table ── */
   .type-section{margin-bottom:22px;}
@@ -105,6 +109,8 @@ _HTML = """<!DOCTYPE html>
   .tc-num.fallen{color:var(--red);}
   .tc-bar{height:4px;border-radius:2px;background:var(--bg3);margin-top:8px;overflow:hidden;}
   .tc-bar-fill{height:100%;background:var(--green);transition:width .4s;}
+  .tc-rate{font-size:11px;color:var(--muted);margin-top:6px;text-align:right;}
+  .tc-rate span{color:var(--green);font-weight:600;}
 
   /* ── Toolbar ── */
   .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;}
@@ -156,39 +162,57 @@ _HTML = """<!DOCTYPE html>
 <body>
 <header>
   <span id="live-dot"></span>
-  <h1>⚡ Proxy IP Checker</h1>
+  <h1>&#9889; Proxy IP Checker</h1>
   <span class="tag">Live DB</span>
   <span class="tag">Tor-ready</span>
-  <span id="refresh-info">Loading…</span>
+  <span id="refresh-info">Loading&hellip;</span>
 </header>
 
 <main>
 
-<!-- ── Global stats ── -->
+<!-- ── Global stat cards ── -->
 <div class="stat-row">
   <div class="stat-card">
-    <div class="lbl">Total in DB</div>
-    <div class="val blue" id="s-total">—</div>
+    <div class="lbl">Total Scanned IPs</div>
+    <div class="val blue" id="s-total">&#8212;</div>
+    <div class="sub">unique IPs ever checked</div>
   </div>
   <div class="stat-card">
-    <div class="lbl">Online now</div>
-    <div class="val green" id="s-online">—</div>
+    <div class="lbl">Online Now</div>
+    <div class="val green" id="s-online">&#8212;</div>
+    <div class="sub">confirmed working</div>
   </div>
   <div class="stat-card">
     <div class="lbl">Fallen</div>
-    <div class="val red" id="s-fallen">—</div>
+    <div class="val red" id="s-fallen">&#8212;</div>
+    <div class="sub">failed last check</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Offline Pending</div>
+    <div class="val yellow" id="s-offline">&#8212;</div>
+    <div class="sub">queued for checking</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Success Rate</div>
+    <div class="val purple" id="s-rate">&#8212;</div>
+    <div class="sub">online / total scanned</div>
+  </div>
+  <div class="stat-card">
+    <div class="lbl">Total File Size</div>
+    <div class="val orange" id="s-size">&#8212;</div>
+    <div class="sub">all proxy list files</div>
   </div>
 </div>
 
 <!-- ── Per-type breakdown ── -->
 <div class="type-section">
-  <h2>Proxies by type — click a card to filter the list</h2>
+  <h2>Proxies by type &mdash; click a card to filter the list</h2>
   <div class="type-grid" id="type-grid"></div>
 </div>
 
 <!-- ── Proxy list ── -->
 <div class="toolbar">
-  <input type="text" id="search" placeholder="🔍  Search IP, country, ISP…" oninput="applyFilter()">
+  <input type="text" id="search" placeholder="&#128269;  Search IP, country, ISP&hellip;" oninput="applyFilter()">
   <select id="filter-status" onchange="applyFilter()">
     <option value="">All statuses</option>
     <option value="online">Online only</option>
@@ -201,9 +225,9 @@ _HTML = """<!DOCTYPE html>
     <option>socks5</option><option>socks5h</option>
   </select>
   <span id="count-lbl"></span>
-  <a class="btn" href="/api/proxies/online.txt" target="_blank">⬇ online.txt</a>
-  <a class="btn" href="/api/proxies" target="_blank">⬇ JSON</a>
-  <button class="btn primary" onclick="refresh()">⟳ Refresh now</button>
+  <a class="btn" href="/api/proxies/online.txt" target="_blank">&#8595; online.txt</a>
+  <a class="btn" href="/api/proxies" target="_blank">&#8595; JSON</a>
+  <button class="btn primary" onclick="refresh()">&#10227; Refresh now</button>
 </div>
 
 <div class="table-wrap">
@@ -230,19 +254,35 @@ _HTML = """<!DOCTYPE html>
 
 <script>
 const PROXY_TYPES = ['http','https','socks4','socks4a','socks5','socks5h'];
-const REFRESH_INTERVAL = 30; // seconds
+const REFRESH_INTERVAL = 30;
 let allProxies = [];
-let countdown = REFRESH_INTERVAL;
-let statsData = {};
+let countdown  = REFRESH_INTERVAL;
+let statsData  = {};
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+function fmt(n)  { return (n || 0).toLocaleString(); }
+function fmtPct(r) { return (r != null ? r.toFixed(1) : '0.0') + '%'; }
+function copyText(t) { navigator.clipboard.writeText(t).catch(()=>{}); }
+
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  const u = ['B','KB','MB','GB'];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+}
 
 // ── Stats & type cards ───────────────────────────────────────────────────────
 async function loadStats() {
   const r = await fetch('/api/stats');
   statsData = await r.json();
 
-  document.getElementById('s-total').textContent  = fmt(statsData.total);
-  document.getElementById('s-online').textContent = fmt(statsData.online);
-  document.getElementById('s-fallen').textContent = fmt(statsData.fallen);
+  document.getElementById('s-total').textContent   = fmt(statsData.total);
+  document.getElementById('s-online').textContent  = fmt(statsData.online);
+  document.getElementById('s-fallen').textContent  = fmt(statsData.fallen);
+  document.getElementById('s-offline').textContent = fmt(statsData.offline_count);
+  document.getElementById('s-rate').textContent    = fmtPct(statsData.success_rate);
+  document.getElementById('s-size').textContent    = fmtBytes(statsData.file_size_bytes);
 
   renderTypeCards();
 }
@@ -253,35 +293,26 @@ function renderTypeCards() {
   grid.innerHTML = '';
 
   PROXY_TYPES.forEach(t => {
-    const d    = (statsData.by_type || {})[t] || {total:0,online:0,fallen:0};
-    const tot  = (d.total  || 0);
-    const on   = (d.online || 0);
-    const fl   = (d.fallen || 0);
-    const pct  = tot > 0 ? Math.round(on / tot * 100) : 0;
+    const d   = (statsData.by_type || {})[t] || {total:0,online:0,fallen:0,success_rate:0};
+    const tot = d.total  || 0;
+    const on  = d.online || 0;
+    const fl  = d.fallen || 0;
+    const pct = tot > 0 ? Math.round(on / tot * 100) : 0;
+    const rate = (d.success_rate || 0).toFixed(1);
 
     const card = document.createElement('div');
     card.className = 'type-card' + (activeTp === t ? ' active' : '');
     card.dataset.type = t;
-    card.innerHTML = \`
-      <div class="tc-name"><code>\${t.toUpperCase()}</code></div>
-      <div class="tc-row">
-        <span class="tc-label">Total</span>
-        <span class="tc-num total">\${fmt(tot)}</span>
-      </div>
-      <div class="tc-row">
-        <span class="tc-label">Online</span>
-        <span class="tc-num online">\${fmt(on)}</span>
-      </div>
-      <div class="tc-row">
-        <span class="tc-label">Fallen</span>
-        <span class="tc-num fallen">\${fmt(fl)}</span>
-      </div>
-      <div class="tc-bar"><div class="tc-bar-fill" style="width:\${pct}%"></div></div>
-    \`;
+    card.innerHTML =
+      '<div class="tc-name"><code>' + t.toUpperCase() + '</code></div>' +
+      '<div class="tc-row"><span class="tc-label">Total</span><span class="tc-num total">' + fmt(tot) + '</span></div>' +
+      '<div class="tc-row"><span class="tc-label">Online</span><span class="tc-num online">' + fmt(on) + '</span></div>' +
+      '<div class="tc-row"><span class="tc-label">Fallen</span><span class="tc-num fallen">' + fmt(fl) + '</span></div>' +
+      '<div class="tc-bar"><div class="tc-bar-fill" style="width:' + pct + '%"></div></div>' +
+      '<div class="tc-rate">Success rate: <span>' + rate + '%</span></div>';
     card.onclick = () => {
       const sel = document.getElementById('filter-type');
-      const isActive = card.classList.contains('active');
-      sel.value = isActive ? '' : t;
+      sel.value = card.classList.contains('active') ? '' : t;
       syncTypeCards();
       applyFilter();
     };
@@ -311,7 +342,7 @@ function pingClass(ms) {
 }
 
 function pingText(ms) {
-  if (!ms || ms <= 0) return '—';
+  if (!ms || ms <= 0) return '&#8212;';
   return Math.round(ms) + ' ms';
 }
 
@@ -320,10 +351,6 @@ function anonBadge(a) {
   if (a === 'Elite')         return '<span class="badge elite">Elite</span>';
   return '<span class="badge anon">Anonymous</span>';
 }
-
-function fmt(n) { return (n || 0).toLocaleString(); }
-
-function copyText(t) { navigator.clipboard.writeText(t).catch(()=>{}); }
 
 function applyFilter() {
   const q  = document.getElementById('search').value.toLowerCase();
@@ -345,53 +372,46 @@ function applyFilter() {
   document.getElementById('count-lbl').textContent =
     fmt(filtered.length) + ' / ' + fmt(allProxies.length) + ' shown';
 
+  const pc = pingClass;
+  const pt = pingText;
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = filtered.slice(0, 2000).map(p => {
     const addr = p.ip + ':' + p.port;
     const ms   = p.response_ms || 0;
-    const loc  = p.country_code || '—';
+    const loc  = p.country_code || '&#8212;';
     const dt   = (p.last_checked || '').replace('T',' ').slice(0,16);
-    return \`<tr>
-      <td><span class="badge \${p.status}">\${p.status}</span></td>
-      <td class="mono">\${addr}
-        <button class="copy-btn" onclick="copyText('\${addr}')" title="Copy">⧉</button>
-      </td>
-      <td><code>\${p.proxy_type}</code></td>
-      <td><span class="ping \${pingClass(ms)">\${pingText(ms)}</span></td>
-      <td>\${anonBadge(p.anonymity)}</td>
-      <td>\${loc}</td>
-      <td style="color:var(--muted);font-size:12px">\${p.city||'—'}</td>
-      <td class="isp-cell" title="\${p.isp||''}">\${p.isp||'—'}</td>
-      <td style="white-space:nowrap;font-size:12px;color:var(--muted)">\${dt}</td>
-    </tr>\`;
+    return '<tr>' +
+      '<td><span class="badge ' + p.status + '">' + p.status + '</span></td>' +
+      '<td class="mono">' + addr + '<button class="copy-btn" onclick="copyText(\'' + addr + '\')" title="Copy">&#10697;</button></td>' +
+      '<td><code>' + p.proxy_type + '</code></td>' +
+      '<td><span class="ping ' + pc(ms) + '">' + pt(ms) + '</span></td>' +
+      '<td>' + anonBadge(p.anonymity) + '</td>' +
+      '<td>' + loc + '</td>' +
+      '<td style="color:var(--muted);font-size:12px">' + (p.city||'&#8212;') + '</td>' +
+      '<td class="isp-cell" title="' + (p.isp||'') + '">' + (p.isp||'&#8212;') + '</td>' +
+      '<td style="white-space:nowrap;font-size:12px;color:var(--muted)">' + dt + '</td>' +
+      '</tr>';
   }).join('');
 }
 
-// ── Auto-refresh with countdown ──────────────────────────────────────────────
+// ── Auto-refresh ─────────────────────────────────────────────────────────────
 function updateRefreshInfo() {
   document.getElementById('refresh-info').textContent =
-    'Next refresh in ' + countdown + 's  |  ' +
-    new Date().toLocaleTimeString();
+    'Next refresh in ' + countdown + 's  |  ' + new Date().toLocaleTimeString();
 }
 
 async function refresh() {
-  document.getElementById('refresh-info').textContent = 'Refreshing…';
+  document.getElementById('refresh-info').textContent = 'Refreshing\u2026';
   countdown = REFRESH_INTERVAL;
   await Promise.all([loadStats(), loadProxies()]);
   updateRefreshInfo();
 }
 
-// Initial load
 refresh();
 
-// Countdown ticker (every second)
 setInterval(() => {
   countdown--;
-  if (countdown <= 0) {
-    refresh();
-  } else {
-    updateRefreshInfo();
-  }
+  if (countdown <= 0) { refresh(); } else { updateRefreshInfo(); }
 }, 1000);
 </script>
 </body>
@@ -407,6 +427,28 @@ app = Flask(__name__)
 _cfg: Dict[str, Path] = {"db_path": proxy_db.DB_PATH}
 
 
+_PROXY_LISTS_DIR = Path("proxy_lists")
+_PROXY_TYPES = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"]
+
+
+def _file_stats() -> Dict[str, object]:
+    """Return offline proxy count and total size of all proxy list .txt files."""
+    offline_count = 0
+    total_bytes = 0
+    if _PROXY_LISTS_DIR.exists():
+        for f in _PROXY_LISTS_DIR.glob("*.txt"):
+            try:
+                total_bytes += f.stat().st_size
+                if f.name.startswith("offline_"):
+                    offline_count += sum(
+                        1 for ln in f.read_text(encoding="utf-8", errors="ignore").splitlines()
+                        if ln.strip() and not ln.startswith("#")
+                    )
+            except OSError:
+                pass
+    return {"offline_count": offline_count, "file_size_bytes": total_bytes}
+
+
 @app.route("/")
 def index() -> str:
     return render_template_string(_HTML)
@@ -415,6 +457,7 @@ def index() -> str:
 @app.route("/api/stats")
 def api_stats():
     stats = proxy_db.get_stats_sync(path=_cfg["db_path"])
+    stats.update(_file_stats())
     return jsonify(stats)
 
 
@@ -463,12 +506,12 @@ if __name__ == "__main__":
     args = _build_parser().parse_args()
 
     if args.db:
+        _cfg["db_path"] = Path(args.db)
         proxy_db.DB_PATH = Path(args.db)
-        global _DB_PATH
-        _DB_PATH = Path(args.db)
 
+    db_path = _cfg["db_path"]
     print(f"[*] Starting Proxy IP Checker web server on {args.host}:{args.port}")
-    print(f"[*] Database: {_DB_PATH}")
+    print(f"[*] Database: {db_path}")
     if args.host == "127.0.0.1":
         print(f"[*] Dashboard:  http://127.0.0.1:{args.port}/")
         print("[*] To expose via Tor, run:  python tor_service.py")
