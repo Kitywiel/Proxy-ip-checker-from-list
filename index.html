@@ -1,71 +1,4 @@
-#!/usr/bin/env python3
-"""
-web_server.py — Flask web UI for the Proxy IP Checker database.
-
-Serves a dark-themed dashboard on http://127.0.0.1:8080 (default).
-When run as a Tor hidden service, the same server is reachable at
-your .onion address via the Tor Browser.
-
-Usage:
-    python web_server.py                    # start on localhost:8080
-    python web_server.py --port 9090        # custom port
-    python web_server.py --host 0.0.0.0    # listen on all interfaces
-    python web_server.py --db path/to/proxies.db
-
-Routes:
-    /                   Dashboard (stats + proxy table)
-    /api/proxies        JSON list of all proxies (optional ?status= &type=)
-    /api/stats          JSON statistics summary
-    /api/proxies/online.txt   Plain-text online proxy list (IP:PORT per line)
-"""
-
-import argparse
-import os
-import subprocess
-import sys
-from pathlib import Path
-from typing import Dict
-
-
-# ---------------------------------------------------------------------------
-# Zero-setup: auto-install missing dependencies before anything else imports
-# ---------------------------------------------------------------------------
-
-def _bootstrap_deps() -> None:
-    """Install any missing third-party packages using the current interpreter."""
-    _required = [("flask", "flask>=3.0.0")]
-    missing = []
-    for module, pkg_spec in _required:
-        try:
-            __import__(module)
-        except ImportError:
-            missing.append(pkg_spec)
-    if missing:
-        print(f"[*] Auto-installing missing packages: {', '.join(missing)} …", flush=True)
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
-        )
-        print("[*] Packages installed — continuing.", flush=True)
-
-_bootstrap_deps()
-
-try:
-    from flask import Flask, jsonify, render_template_string, request, Response
-except ImportError:
-    print("[!] Flask is required:  python -m pip install flask", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    import proxy_db
-except ImportError:
-    print("[!] proxy_db.py not found — place it in the same directory.", file=sys.stderr)
-    sys.exit(1)
-
-# ---------------------------------------------------------------------------
-# HTML template (dark theme, no external resources required)
-# ---------------------------------------------------------------------------
-
-_HTML = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -82,6 +15,17 @@ _HTML = """<!DOCTYPE html>
   body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;}
   a{color:var(--blue);text-decoration:none;}
   a:hover{text-decoration:underline;}
+
+  /* ── Banner ── */
+  #banner{background:#1a2a1a;border-bottom:2px solid var(--green);padding:10px 24px;
+    font-size:12px;color:var(--green);display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  #banner .err{background:#2a1a1a;border-bottom-color:var(--red);color:var(--red);}
+  #server-input{background:var(--bg3);border:1px solid var(--border);border-radius:5px;
+    color:var(--text);padding:4px 8px;font-size:12px;width:240px;}
+  #server-input:focus{outline:none;border-color:var(--blue);}
+  #connect-btn{background:var(--bg3);border:1px solid var(--border);border-radius:5px;
+    color:var(--text);padding:4px 10px;cursor:pointer;font-size:12px;}
+  #connect-btn:hover{border-color:var(--blue);color:var(--blue);}
 
   /* ── Header ── */
   header{background:var(--bg2);border-bottom:1px solid var(--border);padding:14px 24px;
@@ -184,6 +128,18 @@ _HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
+
+<!-- ── Connection banner ── -->
+<div id="banner">
+  <span id="banner-text">&#9889; Connecting to Proxy IP Checker server&hellip;</span>
+  &nbsp;|&nbsp; Server:
+  <input id="server-input" type="text" value="http://127.0.0.1:8080" title="Web server address">
+  <button id="connect-btn" onclick="reconnect()">Connect</button>
+  <span style="color:var(--muted);margin-left:auto">
+    Start the server with: <code style="color:var(--yellow)">python web_server.py</code>
+  </span>
+</div>
+
 <header>
   <span id="live-dot"></span>
   <h1>&#9889; Proxy IP Checker</h1>
@@ -249,8 +205,8 @@ _HTML = """<!DOCTYPE html>
     <option>socks5</option><option>socks5h</option>
   </select>
   <span id="count-lbl"></span>
-  <a class="btn" href="/api/proxies/online.txt" target="_blank">&#8595; online.txt</a>
-  <a class="btn" href="/api/proxies" target="_blank">&#8595; JSON</a>
+  <a class="btn" id="link-txt" href="#" target="_blank">&#8595; online.txt</a>
+  <a class="btn" id="link-json" href="#" target="_blank">&#8595; JSON</a>
   <button class="btn primary" onclick="refresh()">&#10227; Refresh now</button>
 </div>
 
@@ -282,9 +238,10 @@ const REFRESH_INTERVAL = 30;
 let allProxies = [];
 let countdown  = REFRESH_INTERVAL;
 let statsData  = {};
+let serverBase = 'http://127.0.0.1:8080';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-function fmt(n)  { return (n || 0).toLocaleString(); }
+function fmt(n)    { return (n || 0).toLocaleString(); }
 function fmtPct(r) { return (r != null ? r.toFixed(1) : '0.0') + '%'; }
 function copyText(t) { navigator.clipboard.writeText(t).catch(()=>{}); }
 
@@ -296,9 +253,35 @@ function fmtBytes(b) {
   return b.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
 }
 
+function setBannerOk() {
+  const b = document.getElementById('banner');
+  b.style.background = '#1a2a1a';
+  b.style.borderBottomColor = 'var(--green)';
+  document.getElementById('banner-text').style.color = 'var(--green)';
+  document.getElementById('banner-text').textContent =
+    '\u26A1 Connected to ' + serverBase;
+}
+
+function setBannerErr(msg) {
+  const b = document.getElementById('banner');
+  b.style.background = '#2a1a1a';
+  b.style.borderBottomColor = 'var(--red)';
+  document.getElementById('banner-text').style.color = 'var(--red)';
+  document.getElementById('banner-text').textContent =
+    '\u26A0 ' + msg + ' \u2014 make sure web_server.py is running';
+}
+
+function reconnect() {
+  const v = document.getElementById('server-input').value.trim().replace(/\/$/, '');
+  if (v) serverBase = v;
+  document.getElementById('link-txt').href  = serverBase + '/api/proxies/online.txt';
+  document.getElementById('link-json').href = serverBase + '/api/proxies';
+  refresh();
+}
+
 // ── Stats & type cards ───────────────────────────────────────────────────────
 async function loadStats() {
-  const r = await fetch('/api/stats');
+  const r = await fetch(serverBase + '/api/stats');
   statsData = await r.json();
 
   document.getElementById('s-total').textContent   = fmt(statsData.total);
@@ -353,7 +336,7 @@ function syncTypeCards() {
 
 // ── Proxy list ───────────────────────────────────────────────────────────────
 async function loadProxies() {
-  const r = await fetch('/api/proxies?limit=5000');
+  const r = await fetch(serverBase + '/api/proxies?limit=5000');
   allProxies = await r.json();
   applyFilter();
 }
@@ -427,9 +410,19 @@ function updateRefreshInfo() {
 async function refresh() {
   document.getElementById('refresh-info').textContent = 'Refreshing\u2026';
   countdown = REFRESH_INTERVAL;
-  await Promise.all([loadStats(), loadProxies()]);
+  try {
+    await Promise.all([loadStats(), loadProxies()]);
+    setBannerOk();
+  } catch (e) {
+    setBannerErr('Cannot reach ' + serverBase);
+  }
   updateRefreshInfo();
 }
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+serverBase = document.getElementById('server-input').value.trim().replace(/\/$/, '');
+document.getElementById('link-txt').href  = serverBase + '/api/proxies/online.txt';
+document.getElementById('link-json').href = serverBase + '/api/proxies';
 
 refresh();
 
@@ -439,113 +432,4 @@ setInterval(() => {
 }, 1000);
 </script>
 </body>
-</html>"""
-
-# ---------------------------------------------------------------------------
-# Flask app
-# ---------------------------------------------------------------------------
-
-app = Flask(__name__)
-# Mutable container so the entry-point can swap the DB path at runtime
-# without hitting "global declared after assignment" on Python 3.12+.
-_cfg: Dict[str, Path] = {"db_path": proxy_db.DB_PATH}
-
-
-@app.after_request
-def _add_cors_headers(response):
-    """Allow the standalone index.html (opened as file://) to call the API."""
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return response
-
-
-_PROXY_LISTS_DIR = Path("proxy_lists")
-_PROXY_TYPES = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"]
-
-
-def _file_stats() -> Dict[str, object]:
-    """Return offline proxy count and total size of all proxy list .txt files."""
-    offline_count = 0
-    total_bytes = 0
-    if _PROXY_LISTS_DIR.exists():
-        for f in _PROXY_LISTS_DIR.glob("*.txt"):
-            try:
-                total_bytes += f.stat().st_size
-                if f.name.startswith("offline_"):
-                    offline_count += sum(
-                        1 for ln in f.read_text(encoding="utf-8", errors="ignore").splitlines()
-                        if ln.strip() and not ln.startswith("#")
-                    )
-            except OSError:
-                pass
-    return {"offline_count": offline_count, "file_size_bytes": total_bytes}
-
-
-@app.route("/")
-def index() -> str:
-    return render_template_string(_HTML)
-
-
-@app.route("/api/stats")
-def api_stats():
-    stats = proxy_db.get_stats_sync(path=_cfg["db_path"])
-    stats.update(_file_stats())
-    return jsonify(stats)
-
-
-@app.route("/api/proxies")
-def api_proxies():
-    status = request.args.get("status") or None
-    ptype  = request.args.get("type")   or None
-    limit  = min(int(request.args.get("limit", 5000)), 10000)
-    rows   = proxy_db.get_all_proxies_sync(
-        status=status, proxy_type=ptype, limit=limit, path=_cfg["db_path"]
-    )
-    return jsonify(rows)
-
-
-@app.route("/api/proxies/online.txt")
-def api_online_txt():
-    rows = proxy_db.get_all_proxies_sync(status="online", limit=10000, path=_cfg["db_path"])
-    lines = "\n".join(f"{r['ip']}:{r['port']}" for r in rows)
-    return Response(
-        lines,
-        mimetype="text/plain",
-        headers={"Content-Disposition": "attachment; filename=online_proxies.txt"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Proxy IP Checker — web dashboard (Flask)"
-    )
-    p.add_argument("--host", default="127.0.0.1",
-                   help="Bind host (default: 127.0.0.1 — localhost only)")
-    p.add_argument("--port", type=int, default=8080,
-                   help="Bind port (default: 8080)")
-    p.add_argument("--db", metavar="PATH",
-                   help="Path to the SQLite database (default: proxy_lists/proxies.db)")
-    p.add_argument("--debug", action="store_true",
-                   help="Enable Flask debug mode (do NOT use with Tor)")
-    return p
-
-
-if __name__ == "__main__":
-    args = _build_parser().parse_args()
-
-    if args.db:
-        _cfg["db_path"] = Path(args.db)
-        proxy_db.DB_PATH = Path(args.db)
-
-    db_path = _cfg["db_path"]
-    print(f"[*] Starting Proxy IP Checker web server on {args.host}:{args.port}")
-    print(f"[*] Database: {db_path}")
-    if args.host == "127.0.0.1":
-        print(f"[*] Dashboard:  http://127.0.0.1:{args.port}/")
-        print("[*] To expose via Tor, run:  python tor_service.py")
-    app.run(host=args.host, port=args.port, debug=args.debug)
+</html>

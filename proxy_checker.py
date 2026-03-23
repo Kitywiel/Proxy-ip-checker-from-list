@@ -59,8 +59,35 @@ import asyncio
 import logging
 import argparse
 import traceback
+import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Zero-setup: auto-install missing dependencies before anything else imports
+# ---------------------------------------------------------------------------
+
+def _bootstrap_deps() -> None:
+    """Install any missing third-party packages using the current interpreter."""
+    _required = [
+        ("aiohttp",        "aiohttp>=3.9.0"),
+        ("aiohttp_socks",  "aiohttp-socks>=0.8.0"),
+    ]
+    missing = []
+    for module, pkg_spec in _required:
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(pkg_spec)
+    if missing:
+        print(f"[*] Auto-installing missing packages: {', '.join(missing)} …", flush=True)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        )
+        print("[*] Packages installed — continuing.", flush=True)
+
+_bootstrap_deps()
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
@@ -898,6 +925,59 @@ def setup_directories() -> None:
                 filepath.touch()
 
 
+def load_sntbs_files() -> None:
+    """Import proxies from any SNTBS-{type}.txt files found in the current directory.
+
+    SNTBS (Still Need To Be Scanned) files act as a persistent pending queue.
+    Each file is named ``SNTBS-{proxytype}.txt`` (e.g. ``SNTBS-socks5.txt``)
+    and contains one ``IP:PORT`` per line.
+
+    Behaviour:
+      - IPs already in the online or fallen list are silently dropped.
+      - IPs already in the offline queue are silently skipped (already pending).
+      - All remaining IPs are appended to the corresponding
+        ``offline_{type}.txt`` so they will be checked on the next run.
+      - After importing, the SNTBS file is cleared because the imported IPs
+        are now tracked in the offline list.  Any IPs that go unchecked during
+        a run are written back to the SNTBS file by :func:`check_proxies`.
+    """
+    for ptype in PROXY_TYPES:
+        sntbs = Path(f"SNTBS-{ptype}.txt")
+        if not sntbs.exists():
+            continue
+
+        sntbs_entries = read_proxies(sntbs)
+        if not sntbs_entries:
+            continue
+
+        offline = PROXY_LISTS_DIR / f"offline_{ptype}.txt"
+        online  = PROXY_LISTS_DIR / f"online_{ptype}.txt"
+        fallen  = PROXY_LISTS_DIR / f"fallen_{ptype}.txt"
+
+        existing_offline = set(read_proxies(offline))
+        already_online   = {strip_decorations(e) for e in read_proxies(online)}
+        already_fallen   = {strip_decorations(e) for e in read_proxies(fallen)}
+
+        added = 0
+        for line in sntbs_entries:
+            parsed = parse_proxy(line)
+            if parsed is None:
+                continue
+            ip, port = parsed
+            bare = f"{ip}:{port}"
+            if bare in existing_offline or bare in already_online or bare in already_fallen:
+                continue
+            existing_offline.add(bare)
+            added += 1
+
+        if added:
+            write_proxies(offline, sorted(existing_offline))
+            print(f"[*] SNTBS: imported {added} new {ptype.upper()} proxies → {offline.name}")
+
+        # Clear the SNTBS file; unchecked IPs will be written back by check_proxies.
+        sntbs.write_text("", encoding="utf-8")
+
+
 async def _init_db_once() -> None:
     """Initialise the SQLite database (no-op if aiosqlite is not installed)."""
     if _DB_ENABLED:
@@ -1146,6 +1226,7 @@ async def _check_worker(
     counters: Dict[str, int],
     http_session: Optional[aiohttp.ClientSession] = None,
     geo_session: Optional[aiohttp.ClientSession] = None,
+    checked_set: Optional[Set[str]] = None,
 ) -> None:
     """Async worker: test one proxy against one checker URL.
 
@@ -1154,6 +1235,10 @@ async def _check_worker(
     after the whole batch completes, avoiding O(n²) per-proxy rewrites.
     _checked_since_flush is incremented so the background flusher knows
     when 1000 proxies have been processed and triggers a disk write.
+    When *checked_set* is provided, the bare ``IP:PORT`` of every processed
+    proxy is added to it so that :func:`check_proxies` can detect which
+    proxies were not reached (e.g. on interruption) and save them to the
+    SNTBS file.
     """
     global _checked_since_flush
     async with semaphore:
@@ -1220,6 +1305,8 @@ async def _check_worker(
 
         counters["checked"] += 1
         _checked_since_flush += 1
+        if checked_set is not None:
+            checked_set.add(bare)
 
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +1457,7 @@ async def check_proxies(
 
     semaphore = asyncio.Semaphore(max_workers)
     counters: Dict[str, int] = {"checked": 0, "online": 0, "fallen": 0}
+    checked_set: Set[str] = set()
 
     # Shared sessions — one TCPConnector each, reused across all workers.
     http_connector = aiohttp.TCPConnector(ssl=False, limit=0, ttl_dns_cache=300)
@@ -1393,6 +1481,7 @@ async def check_proxies(
                     counters=counters,
                     http_session=http_session,
                     geo_session=geo_session,
+                    checked_set=checked_set,
                 )
                 for i, raw in enumerate(batch)
             ]
@@ -1407,6 +1496,26 @@ async def check_proxies(
         await http_session.close()
         await geo_session.close()
         write_proxies(offline, [])   # bulk clear — O(1) vs O(n²) per-worker
+
+        # Save any proxies that were not reached (e.g. interrupted mid-run)
+        # to SNTBS-{type}.txt so they are preserved for the next run.
+        unchecked = [
+            strip_decorations(p) for p in proxies
+            if strip_decorations(p) not in checked_set
+        ]
+        if unchecked:
+            sntbs = Path(f"SNTBS-{proxy_type}.txt")
+            existing_sntbs: Set[str] = set()
+            if sntbs.exists():
+                existing_sntbs = set(read_proxies(sntbs))
+            existing_sntbs.update(unchecked)
+            sntbs.write_text(
+                "\n".join(sorted(existing_sntbs)) + "\n", encoding="utf-8"
+            )
+            print(
+                f"[~] Saved {len(unchecked)} unchecked {proxy_type.upper()} "
+                f"proxies to {sntbs.name}"
+            )
 
     n_flushed = flush_write_buffer()
     print(
@@ -1889,6 +1998,7 @@ async def async_main() -> None:
     args = parser.parse_args()
 
     setup_directories()
+    load_sntbs_files()  # import any SNTBS-{type}.txt files into the offline queue
 
     # Start the background write-buffer flusher (flushes dirty files every
     # BUFFER_FLUSH_INTERVAL seconds or when buffer exceeds BUFFER_FLUSH_SIZE_KB).
