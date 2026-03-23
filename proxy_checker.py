@@ -22,14 +22,24 @@ Directory layout (auto-created):
 
 Supported types: http, https, socks4, socks4a, socks5, socks5h
 
+GitHub auto-discovery:
+  The `repos` command queries the GitHub API for every repo in
+  GITHUB_REPO_SOURCES, discovers all proxy-list .txt files, classifies them
+  by type, and imports the raw content automatically.  Set the GITHUB_TOKEN
+  environment variable for the higher 5 000 req/hour authenticated rate limit
+  (default: 60 req/hour unauthenticated).
+
 Usage examples:
   python proxy_checker.py add --list my_proxies.txt --type http
   python proxy_checker.py add --urls url_sources.txt --type socks5h
   python proxy_checker.py fetch --type all
+  python proxy_checker.py repos --type all
+  python proxy_checker.py repos --list-repos
   python proxy_checker.py check --type all
   python proxy_checker.py stats
 """
 
+import os
 import re
 import sys
 import time
@@ -380,6 +390,266 @@ PROXY_SOURCE_URLS: Dict[str, List[str]] = {
 }
 
 # ---------------------------------------------------------------------------
+# GitHub repo auto-discovery
+# ---------------------------------------------------------------------------
+
+# Matches https://github.com/{owner}/{repo} (optional trailing slash)
+_GITHUB_REPO_RE = re.compile(
+    r"^https?://github\.com/([A-Za-z0-9_.\-]+)/([A-Za-z0-9_.\-]+)/?$"
+)
+
+# Proxy-list GitHub repositories whose .txt files are auto-discovered via the
+# GitHub API when the `repos` command is run.  Includes all repos from the
+# provided master list plus the other repos whose raw URLs are already in
+# PROXY_SOURCE_URLS — so every source is reachable both ways.
+GITHUB_REPO_SOURCES: List[str] = [
+    # ── Master list repos ────────────────────────────────────────────────
+    "https://github.com/TheSpeedX/PROXY-List",
+    "https://github.com/TheSpeedX/SOCKS-List",
+    "https://github.com/ShiftyTR/Proxy-List",
+    "https://github.com/monosans/proxy-list",
+    "https://github.com/jetkai/proxy-list",
+    "https://github.com/UptimerBot/proxy-list",
+    "https://github.com/clarketm/proxy-list",
+    "https://github.com/roosterkid/openproxylist",
+    "https://github.com/mmpx12/proxy-list",
+    "https://github.com/hookzof/socks5_list",
+    "https://github.com/opsxcq/proxy-list",
+    # ── Additional repos whose raw URLs are already in PROXY_SOURCE_URLS ─
+    "https://github.com/B4RC0DE-TM/proxy-list",
+    "https://github.com/HyperBeats/proxy-list",
+    "https://github.com/caliphdev/Proxy-List",
+    "https://github.com/zevtyardt/proxy-list",
+    "https://github.com/MuRongPIG/Proxy-Master",
+    "https://github.com/prxchk/proxy-list",
+    "https://github.com/Anonym0usWork1221/Free-Proxies",
+    "https://github.com/proxifly/free-proxy-list",
+    "https://github.com/vakhov/fresh-proxy-list",
+    "https://github.com/proxy4parsing/proxy-list",
+    "https://github.com/RX4096/proxy-list",
+    "https://github.com/Zaeem20/FREE_PROXIES_LIST",
+    "https://github.com/saschazesiger/Free-Proxies",
+    "https://github.com/r00tee/Proxy-List",
+    "https://github.com/zloi-user/hideip.me",
+    "https://github.com/proxylist-to/proxy-list",
+    "https://github.com/dpangestuw/Free-Proxy",
+    "https://github.com/yemixzy/proxy-list",
+    "https://github.com/elliottophellia/yakumo",
+    "https://github.com/ErcinDedeoglu/proxies",
+    "https://github.com/ALIILAPRO/Proxy",
+    "https://github.com/ObcbO/getproxy",
+    "https://github.com/officialputuid/KangProxy",
+    "https://github.com/rdavydov/proxy-list",
+    "https://github.com/sunny9577/proxy-scraper",
+    "https://github.com/Volodichev/proxy-list",
+    "https://github.com/hanwayTech/free-proxy-list",
+    "https://github.com/mertguvencli/http-proxy-list",
+    "https://github.com/hendrikbgr/Free-Proxy-Repo",
+    "https://github.com/manuGMG/proxy-365",
+    "https://github.com/zinon/proxy-lists",
+    "https://github.com/Nocturnusx/Proxy-list",
+    "https://github.com/yuceltoluyag/GoodProxy",
+    "https://github.com/aslisk/proxyhttps",
+    "https://github.com/saisuiu/Lionkings-Http-Proxys-Proxies",
+    "https://github.com/im-razvan/proxy_list",
+    "https://github.com/themiralay/Proxy-List-World",
+    "https://github.com/andigwandi/free-proxy",
+    "https://github.com/TundzhayDzhansaz/proxy-list-auto",
+]
+
+
+def _classify_proxy_file(path: str) -> Optional[str]:
+    """Classify a .txt file path as a proxy type based on keywords.
+
+    Checks are ordered most-specific → least-specific to avoid false matches
+    (e.g. ``socks5`` before ``socks4``, ``https`` before ``http``).
+    Returns one of the ``PROXY_TYPES`` strings or ``None`` if the file does
+    not appear to contain a typed proxy list.
+    """
+    lower = path.lower()
+    if "socks5h" in lower:
+        return "socks5h"
+    if "socks4a" in lower:
+        return "socks4a"
+    if "socks5" in lower:
+        return "socks5"
+    if "socks4" in lower:
+        return "socks4"
+    if "socks" in lower:
+        return "socks5"    # bare "socks" → treat as socks5
+    if "https" in lower:
+        return "https"
+    if "http" in lower:
+        return "http"
+    # Common generic filenames that typically contain HTTP proxies
+    name = path.rsplit("/", 1)[-1].lower()
+    if name in {
+        "proxy.txt", "proxies.txt", "list.txt", "raw.txt", "data.txt",
+        "free.txt", "proxy-list-raw.txt", "proxy_list.txt",
+        "proxy-list.txt", "proxylist.txt",
+    }:
+        return "http"
+    return None
+
+
+async def _resolve_github_repo(
+    repo_url: str,
+    session: aiohttp.ClientSession,
+    token: Optional[str] = None,
+) -> Dict[str, List[str]]:
+    """Query the GitHub API to discover all proxy-list ``.txt`` files in
+    *repo_url* and return a mapping of ``{proxy_type: [raw_url, ...]}``.
+
+    *repo_url* must match ``https://github.com/{owner}/{repo}``.
+
+    *token* is a GitHub personal access token; if omitted the
+    ``GITHUB_TOKEN`` env var is used as a fallback.  Authenticated calls
+    have a 5 000 req/hour rate limit vs 60 req/hour unauthenticated.
+    """
+    m = _GITHUB_REPO_RE.match(repo_url.rstrip("/"))
+    if not m:
+        print(f"[!] Not a valid GitHub repo URL: {repo_url}")
+        return {}
+    owner, repo = m.group(1), m.group(2)
+
+    effective_token = token or os.environ.get("GITHUB_TOKEN")
+    headers: Dict[str, str] = {"Accept": "application/vnd.github.v3+json"}
+    if effective_token:
+        headers["Authorization"] = f"Bearer {effective_token}"
+
+    api_base = f"https://api.github.com/repos/{owner}/{repo}"
+
+    # Discover the default branch first (avoids hard-coding "main"/"master").
+    default_branch = "main"
+    try:
+        async with session.get(
+            api_base,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+            ssl=False,
+        ) as resp:
+            if resp.status == 200:
+                meta = await resp.json(content_type=None)
+                default_branch = meta.get("default_branch", "main")
+    except Exception:
+        pass
+
+    # Fetch the full recursive file tree for the default branch.
+    branches_to_try = [default_branch] + (
+        ["master"] if default_branch != "master" else ["main"]
+    )
+    data: dict = {}
+    used_branch = default_branch
+    for branch in branches_to_try:
+        tree_url = f"{api_base}/git/trees/{branch}?recursive=1"
+        try:
+            async with session.get(
+                tree_url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+                ssl=False,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    used_branch = branch
+                    break
+                if resp.status == 404:
+                    continue
+                # Rate-limited or unexpected error
+                body = await resp.text()
+                print(
+                    f"[!] GitHub API {resp.status} for {owner}/{repo}: "
+                    f"{body[:120]}"
+                )
+                return {}
+        except Exception as exc:
+            print(f"[!] GitHub API request failed for {owner}/{repo}: {exc}")
+            return {}
+    else:
+        print(f"[!] Could not resolve branch for {owner}/{repo}")
+        return {}
+
+    raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{used_branch}"
+    result: Dict[str, List[str]] = {}
+    for item in data.get("tree", []):
+        if item.get("type") != "blob":
+            continue
+        path = item["path"]
+        if not path.endswith(".txt"):
+            continue
+        ptype = _classify_proxy_file(path)
+        if ptype is None:
+            continue
+        result.setdefault(ptype, []).append(f"{raw_base}/{path}")
+
+    found = sum(len(v) for v in result.values())
+    if found:
+        summary = ", ".join(
+            f"{t}×{len(urls)}" for t, urls in sorted(result.items())
+        )
+        print(f"    {owner}/{repo}  → {found} file(s)  [{summary}]")
+    else:
+        print(f"    {owner}/{repo}  → no proxy .txt files found")
+    return result
+
+
+async def fetch_github_repos(
+    proxy_type: str,
+    token: Optional[str] = None,
+) -> None:
+    """Query every repo in ``GITHUB_REPO_SOURCES`` via the GitHub API,
+    discover raw proxy-list URLs, and import the proxies.
+
+    *proxy_type* is ``"all"`` or one of the six specific types.
+    *token* overrides the ``GITHUB_TOKEN`` env var.
+    """
+    effective_token = token or os.environ.get("GITHUB_TOKEN")
+    if not effective_token:
+        print(
+            "[i] No GITHUB_TOKEN set — using unauthenticated GitHub API "
+            "(60 req/hour limit).  Set GITHUB_TOKEN env var for higher limits."
+        )
+
+    types_wanted: set = set(PROXY_TYPES if proxy_type == "all" else [proxy_type])
+    print(f"\n[*] Resolving {len(GITHUB_REPO_SOURCES)} GitHub repos via API …\n")
+
+    # Use a low concurrency limit to avoid hammering the GitHub API.
+    connector = aiohttp.TCPConnector(ssl=False, limit=5)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        results = await asyncio.gather(
+            *[
+                _resolve_github_repo(url, session, effective_token)
+                for url in GITHUB_REPO_SOURCES
+            ],
+            return_exceptions=True,
+        )
+
+    # Merge: group discovered raw URLs by proxy type.
+    by_type: Dict[str, List[str]] = {}
+    for repo_url, result in zip(GITHUB_REPO_SOURCES, results):
+        if isinstance(result, Exception):
+            print(f"[!] Exception resolving {repo_url}: {result}")
+            continue
+        for ptype, urls in result.items():
+            if ptype in types_wanted:
+                by_type.setdefault(ptype, []).extend(urls)
+
+    # Deduplicate (the same raw URL can appear in multiple repos).
+    for ptype in by_type:
+        seen: set = set()
+        by_type[ptype] = [
+            u for u in by_type[ptype] if not (u in seen or seen.add(u))  # type: ignore[func-returns-value]
+        ]
+
+    # Import each type's URLs.
+    for ptype in sorted(by_type):
+        urls = by_type[ptype]
+        if urls:
+            print(f"\n[*] Fetching {len(urls)} discovered raw URLs for {ptype.upper()} …")
+            await _import_from_url_list(urls, ptype)
+
+
+# ---------------------------------------------------------------------------
 # Async-safe file helpers
 # ---------------------------------------------------------------------------
 
@@ -620,10 +890,7 @@ async def _anonymity_check(
       ``"Anonymous"`` – proxy-type headers present but no client IP leaked
       ``"Unknown"``   – could not reach the check endpoint
     """
-    PROXY_HEADERS = {"X-Forwarded-For", "X-Real-Ip", "Via", "Proxy-Connection",
-                     "Forwarded", "X-Proxy-Id", "X-Forwarded-Host"}
     proxy_url = f"{proxy_type}://{ip}:{port}"
-    client_timeout = aiohttp.ClientTimeout(total=timeout)
     async with _get_geo_semaphore():
         try:
             if proxy_type in ("socks4", "socks4a", "socks5", "socks5h"):
@@ -887,21 +1154,45 @@ async def add_from_urls(urls_file: str, proxy_type: str) -> None:
     """
     Download proxy lists from each URL in *urls_file* concurrently and import
     them into offline_{proxy_type}.txt, ignoring duplicates.
+
+    If *urls_file* contains ``https://github.com/{owner}/{repo}`` lines the
+    GitHub API is queried to discover the raw .txt files for *proxy_type*
+    automatically — no need to look up the raw URLs manually.
     """
     uf = Path(urls_file)
     if not uf.exists():
         sys.exit(f"[!] URLs file not found: {urls_file}")
 
-    urls = [
+    raw_lines = [
         ln.strip()
         for ln in uf.read_text(encoding="utf-8").splitlines()
         if ln.strip() and not ln.startswith("#")
     ]
-    if not urls:
+    if not raw_lines:
         print("[!] No URLs found in the file.")
         return
 
-    await _import_from_url_list(urls, proxy_type)
+    # Split into plain fetch URLs and GitHub repo URLs.
+    repo_urls = [u for u in raw_lines if _GITHUB_REPO_RE.match(u.rstrip("/"))]
+    plain_urls = [u for u in raw_lines if not _GITHUB_REPO_RE.match(u.rstrip("/"))]
+
+    expanded: List[str] = []
+    if repo_urls:
+        print(f"[*] Expanding {len(repo_urls)} GitHub repo URL(s) via API …")
+        token = os.environ.get("GITHUB_TOKEN")
+        connector = aiohttp.TCPConnector(ssl=False, limit=5)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            results = await asyncio.gather(
+                *[_resolve_github_repo(u, session, token) for u in repo_urls],
+                return_exceptions=True,
+            )
+        for repo_url, result in zip(repo_urls, results):
+            if isinstance(result, Exception):
+                print(f"[!] Exception resolving {repo_url}: {result}")
+                continue
+            expanded.extend(result.get(proxy_type, []))
+
+    await _import_from_url_list(plain_urls + expanded, proxy_type)
 
 
 async def fetch_builtin(proxy_type: str) -> None:
@@ -1028,6 +1319,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which type(s) to fetch (default: all)",
     )
 
+    # -- repos --
+    repos_p = sub.add_parser(
+        "repos",
+        help="Auto-discover raw proxy files from GitHub repos via the API",
+    )
+    repos_p.add_argument(
+        "--type", "-t",
+        choices=PROXY_TYPES + ["all"],
+        default="all",
+        metavar="TYPE",
+        help="Which proxy type(s) to import (default: all)",
+    )
+    repos_p.add_argument(
+        "--token",
+        metavar="TOKEN",
+        default=None,
+        help=(
+            "GitHub personal access token — overrides the GITHUB_TOKEN "
+            "env var.  Raises the rate limit from 60 to 5 000 req/hour."
+        ),
+    )
+    repos_p.add_argument(
+        "--list-repos",
+        action="store_true",
+        help="Print the list of configured GitHub repo sources and exit",
+    )
+
     # -- check --
     chk_p = sub.add_parser("check", help="Test proxies from the offline lists")
     chk_p.add_argument(
@@ -1072,6 +1390,15 @@ async def async_main() -> None:
 
     elif args.command == "fetch":
         await fetch_builtin(args.type)
+
+    elif args.command == "repos":
+        if args.list_repos:
+            print(f"\n=== Configured GitHub Repository Sources ({len(GITHUB_REPO_SOURCES)}) ===\n")
+            for url in GITHUB_REPO_SOURCES:
+                print(f"  {url}")
+            print()
+        else:
+            await fetch_github_repos(args.type, token=args.token)
 
     elif args.command == "check":
         types = PROXY_TYPES if args.type == "all" else [args.type]

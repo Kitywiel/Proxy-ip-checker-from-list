@@ -6,10 +6,11 @@ A Python script that checks proxy lists, categorises each proxy as **online** or
 
 ## Features
 
-* **Three input sources**
+* **Four input sources**
   * Option **a** – a local text file (one `IP:PORT` per line)
-  * Option **b** – a file containing URLs that serve proxy lists
-  * Option **c** – the built-in database of 170+ public proxy-list URLs (`fetch` command), covering GitHub repos, proxyscrape v2/v3, proxyscan.io, openproxy.space, spys.me, geonode, and more
+  * Option **b** – a file containing URLs (plain raw URLs *or* `https://github.com/{owner}/{repo}` lines — the latter are auto-expanded via the GitHub API)
+  * Option **c** – the built-in database of 170+ public proxy-list URLs (`fetch` command)
+  * Option **d** – 50 GitHub repositories auto-discovered via the GitHub API (`repos` command): finds every `.txt` file, classifies it by type, and fetches raw content
 * **One checker URL per proxy** – a rotating pool of ~50 IP-echo services ensures no single service is hammered and rate-limit risk is minimised.
 * **Fully async** – all network I/O (URL fetching and proxy checking) runs with `asyncio` + `aiohttp` for maximum throughput (default 200 concurrent checks).
 * **General info per proxy** – when a proxy is confirmed online the tool automatically gathers:
@@ -57,7 +58,42 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Fetch proxies from the built-in source list
+### Auto-discover proxies from GitHub repos
+
+The `repos` command queries **50 configured GitHub repositories** via the GitHub API, automatically discovers every proxy-list `.txt` file in each repo, classifies each file by proxy type from its filename, and fetches the raw content — no manual URL maintenance needed.
+
+```bash
+# Fetch from all 50 GitHub repos (all proxy types)
+python proxy_checker.py repos
+
+# Fetch only SOCKS5 files from GitHub repos
+python proxy_checker.py repos --type socks5
+
+# List all configured GitHub repo sources
+python proxy_checker.py repos --list-repos
+
+# Use a GitHub token for 5 000 req/hour (vs 60 req/hour unauthenticated)
+GITHUB_TOKEN=ghp_xxx python proxy_checker.py repos
+# or
+python proxy_checker.py repos --token ghp_xxx
+```
+
+When the `GITHUB_TOKEN` environment variable (or `--token`) is set, authenticated GitHub API calls are used which have a much higher rate limit. For 50 repos the unauthenticated limit (60/hour) is usually sufficient — the command makes 1–2 API calls per repo.
+
+**GitHub repo URL auto-expansion in `add --urls`**
+
+If your URLs file contains `https://github.com/{owner}/{repo}` lines alongside plain `https://raw.githubusercontent.com/…` URLs, the tool automatically expands the repo URLs to raw file URLs for the specified type:
+
+```
+# proxy_sources.txt
+https://github.com/TheSpeedX/PROXY-List
+https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt
+```
+```bash
+python proxy_checker.py add --urls proxy_sources.txt --type socks5
+```
+
+
 
 Download from 170+ public proxy-list sources (GitHub repos + web APIs) in one command:
 ```bash
